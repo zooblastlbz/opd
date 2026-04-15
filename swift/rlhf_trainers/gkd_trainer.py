@@ -10,7 +10,6 @@ from accelerate.utils import gather_object, is_peft_model
 from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
 from enum import Enum
 from packaging import version
 from transformers import PreTrainedModel
@@ -22,6 +21,7 @@ from swift.trainers import SwiftMixin, disable_gradient_checkpointing
 from swift.utils import (JsonlWriter, get_logger, is_swanlab_available, is_wandb_available, remove_response, to_device,
                          unwrap_model_for_generation)
 from .rollout_mixin import DataType, RolloutTrainerMixin
+from .teacher_utils import TeacherOutput, build_opsd_teacher_data, fetch_teacher_logprobs, generalized_jsd_loss
 from .utils import (get_gather_if_zero3_context, identity_data_collator, prepare_deepspeed, profiling_context,
                     profiling_decorator)
 
@@ -50,29 +50,6 @@ class DataSource(str, Enum):
     STUDENT = 'student'  # On-policy: student model generates responses
     TEACHER = 'teacher'  # Sequential KD: teacher model generates responses
     DATASET = 'dataset'  # Off-policy: use dataset responses
-
-
-@dataclass
-class TeacherOutput:
-    """Unified container for teacher model outputs from all three sources:
-    local full-vocab, local top-k, and external API top-k.
-    """
-    full_logits: Optional[torch.Tensor] = None
-    topk_logprobs: Optional[torch.Tensor] = None
-    topk_indices: Optional[torch.Tensor] = None
-    opsd_teacher_labels: Optional[torch.Tensor] = None
-
-    @property
-    def is_topk_mode(self) -> bool:
-        return self.topk_logprobs is not None and self.topk_indices is not None
-
-    def validate(self):
-        if self.full_logits is None and not self.is_topk_mode:
-            raise ValueError('TeacherOutput must provide either full_logits or '
-                             '(topk_logprobs, topk_indices). Got neither.')
-
-
-teacher_model_server_model_name = None
 
 
 class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
@@ -146,24 +123,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         Returns None if teacher_prompt is not available in all examples.
         """
-        if not all('teacher_prompt' in data and data['teacher_prompt'] for data in inputs):
-            return None
-
         assert not self.use_liger_gkd_loss, 'OPSD is only supported when use_liger_gkd_loss is False.'
-
-        teacher_data = []
-        for data in inputs:
-            teacher_item = {k: v for k, v in data.items() if k != 'teacher_prompt'}
-            messages = [dict(m) for m in data.get('messages', [])]
-            if messages and messages[-1]['role'] == 'assistant':
-                messages.pop()
-            for msg in reversed(messages):
-                if msg['role'] == 'user':
-                    msg['content'] = data['teacher_prompt']
-                    break
-            teacher_item['messages'] = messages
-            teacher_data.append(teacher_item)
-        return teacher_data
+        return build_opsd_teacher_data(inputs)
 
     def _compute_jsd_loss(self, student_logits, teacher_output: TeacherOutput, labels):
         """Compute JSD loss using unified TeacherOutput.
@@ -710,21 +671,6 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             )
             self.use_liger_gkd_loss = True
 
-    @staticmethod
-    def _align_vocab_size(student_logits, teacher_logits):
-        """Align vocab dimensions between student and teacher by padding the smaller one."""
-        stu_vocab = student_logits.shape[-1]
-        tea_vocab = teacher_logits.shape[-1]
-        if stu_vocab == tea_vocab:
-            return student_logits, teacher_logits
-        if stu_vocab < tea_vocab:
-            student_logits = F.pad(student_logits, (0, tea_vocab - stu_vocab), 'constant', 0)
-            student_logits[..., stu_vocab:] = teacher_logits[..., stu_vocab:]
-        else:
-            teacher_logits = F.pad(teacher_logits, (0, stu_vocab - tea_vocab), 'constant', 0)
-            teacher_logits[..., tea_vocab:] = student_logits[..., tea_vocab:]
-        return student_logits, teacher_logits
-
     def generalized_jsd_loss(
         self,
         student_logits,
@@ -737,76 +683,17 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         teacher_topk_logprobs=None,
         teacher_topk_indices=None,
     ):
-        # Align vocab sizes when student and teacher have different vocabulary dimensions
-        if teacher_logits is not None:
-            student_logits, teacher_logits = self._align_vocab_size(student_logits, teacher_logits)
-
-        # Top-k mode: gather/topk first to get small [*, k] tensors, then scale in-place
-        if teacher_topk_logprobs is not None and teacher_topk_indices is not None:
-            student_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_indices)
-            student_logits.div_(temperature)
-            teacher_logits = teacher_topk_logprobs / temperature
-            temperature = 1.0
-        elif topk is not None and teacher_logits is not None:
-            teacher_logits, topk_idx = torch.topk(teacher_logits, k=topk, dim=-1)
-            teacher_logits.div_(temperature)
-            student_logits = torch.gather(student_logits, dim=-1, index=topk_idx)
-            student_logits.div_(temperature)
-            temperature = 1.0
-
-        if labels is not None:
-            mask = labels != -100
-            student_logits = student_logits[mask]
-            teacher_logits = teacher_logits[mask]
-            num_valid = mask.sum()
-        else:
-            student_logits = student_logits.view(-1, student_logits.size(-1))
-            teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
-            num_valid = student_logits.size(0)
-        student_logits.div_(temperature)
-        teacher_logits.div_(temperature)
-
-        if num_valid == 0:
-            return student_logits.new_zeros(())
-
-        num_valid_int = num_valid if isinstance(num_valid, int) else num_valid.item()
-        total_loss = student_logits.new_zeros(())
-
-        if beta != 0 and beta != 1:
-            beta_t = torch.tensor(beta, dtype=student_logits.dtype, device=student_logits.device)
-            log_beta = torch.log(beta_t)
-            log_1_minus_beta = torch.log1p(-beta_t)
-        else:
-            beta_t = log_beta = log_1_minus_beta = None
-
-        for start_idx in range(0, num_valid_int, chunk_size):
-            end_idx = min(start_idx + chunk_size, num_valid_int)
-            s_chunk = student_logits[start_idx:end_idx]
-            t_chunk = teacher_logits[start_idx:end_idx]
-
-            s_log_probs = F.log_softmax(s_chunk, dim=-1)
-            t_log_probs = F.log_softmax(t_chunk, dim=-1)
-            del s_chunk, t_chunk
-
-            if beta == 0:
-                jsd_chunk = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
-            elif beta == 1:
-                jsd_chunk = F.kl_div(t_log_probs, s_log_probs, reduction='none', log_target=True)
-            else:
-                mixture_log_probs = torch.logsumexp(
-                    torch.stack([s_log_probs + log_1_minus_beta, t_log_probs + log_beta]),
-                    dim=0,
-                )
-                kl_teacher = F.kl_div(mixture_log_probs, t_log_probs, reduction='none', log_target=True)
-                kl_student = F.kl_div(mixture_log_probs, s_log_probs, reduction='none', log_target=True)
-                del mixture_log_probs
-                jsd_chunk = beta_t * kl_teacher + (1 - beta_t) * kl_student
-                del kl_teacher, kl_student
-
-            total_loss = total_loss + jsd_chunk.sum()
-            del jsd_chunk, s_log_probs, t_log_probs
-
-        return total_loss / num_valid
+        return generalized_jsd_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            labels=labels,
+            beta=beta,
+            temperature=temperature,
+            chunk_size=chunk_size,
+            topk=topk,
+            teacher_topk_logprobs=teacher_topk_logprobs,
+            teacher_topk_indices=teacher_topk_indices,
+        )
 
     def _prepare_logging(self):
         """Initialize logging components for on-policy rollout tracking."""
@@ -875,123 +762,3 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                     row = [table[header][i] for header in headers]
                     rows.append(row)
                 swanlab.log({'completions': swanlab.echarts.Table().add(headers, rows)})
-
-
-def _build_teacher_session(max_retries=5):
-    """Build a requests.Session with transport-level retry for teacher API calls."""
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    retry_strategy = Retry(
-        total=max_retries,
-        connect=max_retries,
-        read=max_retries,
-        status=3,
-        status_forcelist=[500, 502, 503],
-        backoff_factor=2,
-        allowed_methods=['POST', 'GET'],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session = requests.Session()
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
-
-
-_teacher_session = None
-
-
-def fetch_teacher_logprobs(base_url, input_ids, topk=20, timeout=300.0):
-    """Fetch top-k prompt logprobs from a vLLM-compatible /v1/completions endpoint.
-
-    Uses prompt_logprobs to get logprobs for input tokens without generating.
-    vLLM prompt_logprobs are always raw (temperature=1) log-probabilities from the model;
-    the temperature parameter in the API only affects token sampling, not prompt_logprobs.
-
-    Args:
-        base_url: vLLM server URL (e.g., 'http://localhost:8000').
-        input_ids: List of token ID sequences.
-        topk: Number of top log probabilities per token.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        (logprobs, indices) tensors of shape [batch, max_seq_len - 1, topk].
-        The shift is because prompt_logprobs[0] is always None (first token has no
-        conditional probability), so position i in the output corresponds to
-        P(token_{i+1} | token_0..token_i), aligning with model logits[i].
-
-    Raises:
-        RuntimeError: If any sequence fails after all retry attempts.
-    """
-    import logging
-    from concurrent.futures import ThreadPoolExecutor
-
-    global _teacher_session
-    if _teacher_session is None:
-        _teacher_session = _build_teacher_session()
-    session = _teacher_session
-
-    _logger = logging.getLogger(__name__)
-    base_url = base_url.rstrip('/')
-    batch_size = len(input_ids)
-    max_seq_len = max(len(ids) for ids in input_ids)
-    url = f'{base_url}/v1/completions'
-    global teacher_model_server_model_name
-    if teacher_model_server_model_name is None:
-        try:
-            resp = session.get(f'{base_url}/v1/models', timeout=10)
-            model = resp.json()['data'][0]['id'] if resp.ok else 'default'
-        except Exception:
-            model = 'default'
-        teacher_model_server_model_name = model
-    else:
-        model = teacher_model_server_model_name
-
-    # prompt_logprobs[0] is always None (no conditional prob for the first token),
-    # prompt_logprobs[i] = P(token_i | token_0..token_{i-1}) which aligns with logits[i-1].
-    # So we skip position 0 and the result has shape [batch, max_seq_len-1, topk],
-    # aligning with student logits which predict the next token at each position.
-    out_len = max_seq_len - 1
-    logprobs_out = torch.full((batch_size, out_len, topk), float('-inf'), dtype=torch.float32)
-    indices_out = torch.zeros((batch_size, out_len, topk), dtype=torch.long)
-    errors = {}
-
-    def _fetch_one(batch_idx):
-        payload = {
-            'model': model,
-            'prompt': input_ids[batch_idx],
-            'max_tokens': 1,
-            'temperature': 0,
-            'prompt_logprobs': topk,
-        }
-        try:
-            resp = session.post(url, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            prompt_logprobs_list = resp.json()['choices'][0].get('prompt_logprobs', [])
-            # Skip position 0 (always None), shift left so pos 1 -> output pos 0
-            for raw_pos in range(1, len(prompt_logprobs_list)):
-                pos_lp = prompt_logprobs_list[raw_pos]
-                if pos_lp is None:
-                    continue
-                out_pos = raw_pos - 1
-                if out_pos >= out_len:
-                    break
-                sorted_items = sorted(pos_lp.items(), key=lambda x: -x[1]['logprob'])[:topk]
-                for k, (tid_str, info) in enumerate(sorted_items):
-                    indices_out[batch_idx, out_pos, k] = int(tid_str)
-                    logprobs_out[batch_idx, out_pos, k] = info['logprob']
-        except Exception as e:
-            errors[batch_idx] = e
-            _logger.error(f'Failed to get teacher logprobs for sequence {batch_idx}: {e}')
-
-    with ThreadPoolExecutor(max_workers=min(batch_size, 8)) as pool:
-        list(pool.map(_fetch_one, range(batch_size)))
-
-    if errors:
-        failed = sorted(errors.keys())
-        raise RuntimeError(f'Failed to fetch teacher logprobs for {len(errors)} sequence(s). '
-                           f'Failed indices: {failed}. Last errors: ' + '; '.join(f'seq {i}: {errors[i]}'
-                                                                                  for i in failed[:3]))
-
-    return logprobs_out, indices_out

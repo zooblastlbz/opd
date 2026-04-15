@@ -7,6 +7,7 @@ Advanced Research
    CISPO.md
    DAPO.md
    deepeyes.md
+   GRADE_Gated.md
    GSPO.md
    CHORD.md
    RLOO.md

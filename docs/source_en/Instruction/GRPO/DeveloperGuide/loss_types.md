@@ -115,3 +115,19 @@ where:
 SAPO uses temperature-controlled soft gating instead of hard clipping to achieve smooth gradient attenuation. The normalization method is the same as GRPO.
 
 For details, please refer to [SAPO](../AdvancedResearch/SAPO.md)
+
+## GRADE-Gated
+
+`--loss_type grade_gated`
+
+GRADE-Gated combines two sample-level objectives:
+
+- `GRPO(local)`: the usual GRPO clipping form with token-level locally modulated advantages
+- `OPD`: KL alignment on completion tokens between teacher and student, with `forward_kl` and `reverse_kl`
+- the gate input now supports three strategies: legacy `group_minmax`, absolute `fixed_range`, and moving-statistics `ema`
+
+The final sample loss is:
+
+$$\mathcal{L}_i = \alpha_i \mathcal{L}_i^{\text{GRPO(local)}} + (1 - \alpha_i)\mathcal{L}_i^{\text{OPD}}$$
+
+See [GRADE-Gated](../AdvancedResearch/GRADE_Gated.md) for details.

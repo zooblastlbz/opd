@@ -515,6 +515,54 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate and self.multi_turn_scheduler is not None:
             raise NotImplementedError('Currently, async_generate is not supported with multi-turn functionality.')
 
+        if self.ref_kl_extra_vocab_topk < 0:
+            raise ValueError(
+                f'ref_kl_extra_vocab_topk must be greater than or equal to 0, got {self.ref_kl_extra_vocab_topk}.')
+        if self.ref_kl_extra_vocab_topk > 0:
+            if self.kl_in_reward:
+                raise ValueError('ref_kl_extra_vocab_topk currently requires kl_in_reward=False.')
+            if self.use_liger_kernel:
+                raise ValueError('ref_kl_extra_vocab_topk is not supported with liger kernel.')
+            if self.sequence_parallel_size > 1:
+                raise ValueError('ref_kl_extra_vocab_topk does not support sequence parallel yet.')
+            if self.padding_free:
+                raise ValueError('ref_kl_extra_vocab_topk does not support padding_free yet.')
+
+        if self.loss_type == 'grade_gated':
+            if self.advantage_estimator != 'grpo':
+                raise ValueError('grade_gated currently only supports advantage_estimator=grpo.')
+            if self.kl_in_reward:
+                raise ValueError('grade_gated requires kl_in_reward=False.')
+            if self.chord_sft_dataset:
+                raise ValueError('grade_gated does not support chord_sft_dataset.')
+            if self.use_liger_kernel:
+                raise ValueError('grade_gated does not support liger kernel.')
+            if self.sequence_parallel_size > 1:
+                raise ValueError('grade_gated does not support sequence parallel yet.')
+            if self.padding_free:
+                raise ValueError('grade_gated does not support padding_free yet.')
+            if self.grade_reward_norm not in {'group_minmax', 'fixed_range', 'ema'}:
+                raise ValueError(
+                    "grade_reward_norm must be one of 'group_minmax', 'fixed_range', or 'ema', "
+                    f'got {self.grade_reward_norm}.')
+            if self.grade_reward_norm == 'fixed_range' and self.grade_reward_min >= self.grade_reward_max:
+                raise ValueError('grade_reward_min must be smaller than grade_reward_max in fixed_range mode.')
+            if not 0.0 <= self.grade_reward_ema_decay < 1.0:
+                raise ValueError(
+                    f'grade_reward_ema_decay must be in [0, 1), got {self.grade_reward_ema_decay}.')
+            if self.grade_reward_ema_eps <= 0:
+                raise ValueError(f'grade_reward_ema_eps must be positive, got {self.grade_reward_ema_eps}.')
+            if self.grade_reward_ema_clip <= 0:
+                raise ValueError(f'grade_reward_ema_clip must be positive, got {self.grade_reward_ema_clip}.')
+            if self.grade_opd_loss_type not in {'forward_kl', 'reverse_kl'}:
+                raise ValueError(
+                    f"grade_opd_loss_type must be 'forward_kl' or 'reverse_kl', got {self.grade_opd_loss_type}.")
+            if self.grade_alpha_piecewise_low >= self.grade_alpha_piecewise_high:
+                raise ValueError('grade_alpha_piecewise_low must be smaller than grade_alpha_piecewise_high.')
+            if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
+                raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
+            self._check_teacher_distillation(mode='GRADE-Gated', require_seq_kd_checks=False)
+
     def _external_vllm_warning(self):
         if self.rlhf_type not in rlhf_support_vllm_types or not self.vllm_server_host:
             return
@@ -577,41 +625,35 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
 
-        if self.teacher_model is not None and self.teacher_model_server is not None:
-            raise ValueError('GKD requires either `teacher_model` or `teacher_model_server` to be set, not both.')
-
-        # Self-distillation: teacher_model == student model
-        self._teacher_use_disable_adapter = False
-        if self.teacher_model is not None and self.teacher_model == self.model:
-            if self.tuner_type == 'lora':
-                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
-                self._teacher_use_disable_adapter = True
-                self.teacher_model = None
-            else:
-                # Full training + same teacher_model: a separate frozen copy will be loaded as fixed teacher.
-                pass
-
-        # Self-distillation: no teacher_model → dynamic teacher (current student weights)
-        if self.teacher_model is None and self.teacher_model_server is None:
-            logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
-
-            if self.seq_kd:
-                raise ValueError(
-                    'Self-distillation mode with seq_kd is not supported yet, please specify a teacher_model.')
-            if self.use_liger_kernel:
-                raise ValueError('Self-distillation mode with liger kernel GKD loss is not supported yet')
-
-        # When using teacher_model_server, gkd_logits_topk is required (API only returns top-k logprobs)
-        if self.teacher_model_server is not None:
-            if self.gkd_logits_topk is None:
-                raise ValueError('gkd_logits_topk is required when using teacher_model_server')
-
-        # Validate gkd_logits_topk
-        if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
-            raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')
+        self._check_teacher_distillation(mode='GKD', require_seq_kd_checks=True)
 
         if self.gkd_logits_topk is not None and self.use_liger_kernel:
             raise ValueError('gkd_logits_topk is not supported when using liger kernel')
 
         if self.teacher_model_server and self.seq_kd:
             raise NotImplementedError('Sequential KD is not supported when using teacher_model_server')
+
+    def _check_teacher_distillation(self, mode: str, require_seq_kd_checks: bool):
+        if self.teacher_model is not None and self.teacher_model_server is not None:
+            raise ValueError(f'{mode} requires either `teacher_model` or `teacher_model_server`, not both.')
+
+        self._teacher_use_disable_adapter = False
+        if self.teacher_model is not None and self.teacher_model == self.model:
+            if self.tuner_type == 'lora':
+                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
+                self._teacher_use_disable_adapter = True
+                self.teacher_model = None
+
+        if self.teacher_model is None and self.teacher_model_server is None:
+            logger.info(f'No teacher_model specified. Using self-distillation mode for {mode}.')
+            if require_seq_kd_checks and self.seq_kd:
+                raise ValueError(
+                    'Self-distillation mode with seq_kd is not supported yet, please specify a teacher_model.')
+            if require_seq_kd_checks and self.use_liger_kernel:
+                raise ValueError('Self-distillation mode with liger kernel GKD loss is not supported yet')
+
+        if self.teacher_model_server is not None and self.gkd_logits_topk is None:
+            raise ValueError('gkd_logits_topk is required when using teacher_model_server')
+
+        if self.gkd_logits_topk is not None and self.gkd_logits_topk <= 0:
+            raise ValueError(f'gkd_logits_topk must be a positive integer, got {self.gkd_logits_topk}')

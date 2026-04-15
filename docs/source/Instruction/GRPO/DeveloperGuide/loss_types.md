@@ -115,3 +115,19 @@ $$\mathcal{L}_{\text{DAPO}} = \frac{\sum_{i=1}^{N} \sum_{t=1}^{T_i} \mathcal{L}_
 SAPO使用温度控制的软门控替代硬裁剪，实现平滑的梯度衰减。归一化方式与GRPO相同。
 
 详细说明请参考 [SAPO](../AdvancedResearch/SAPO.md)
+
+## GRADE-Gated
+
+`--loss_type grade_gated`
+
+GRADE-Gated 会在每个样本上组合两部分目标：
+
+- `GRPO(local)`：保留 GRPO 的裁剪形式，但使用 token 级局部调制优势
+- `OPD`：teacher/student 在 completion token 上的 KL 对齐，支持 `forward_kl` 与 `reverse_kl`
+- gate 输入支持三种策略：旧版 `group_minmax`、绝对区间 `fixed_range`、滑动统计 `ema`
+
+最终按样本级 gate `alpha_i` 组合：
+
+$$\mathcal{L}_i = \alpha_i \mathcal{L}_i^{\text{GRPO(local)}} + (1 - \alpha_i)\mathcal{L}_i^{\text{OPD}}$$
+
+详细说明请参考 [GRADE-Gated](../AdvancedResearch/GRADE_Gated.md)

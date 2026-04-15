@@ -91,7 +91,10 @@ class SwiftRLHF(SwiftSft):
                 task_type=task_type,
                 num_labels=num_labels)
 
-        adapters = args.adapters if key == 'ref' else args.reward_adapters
+        if key == 'teacher':
+            adapters = args.teacher_adapters
+        else:
+            adapters = args.adapters if key == 'ref' else args.reward_adapters
         model = prepare_adapter(args, model, adapters)
         if origin_key in {'ref', 'reward', 'teacher'}:
             if self.args.sequence_parallel_size > 1:
@@ -118,7 +121,8 @@ class SwiftRLHF(SwiftSft):
                 continue
             if key == 'value' and args.rlhf_type != 'ppo':
                 continue
-            if key == 'teacher' and args.rlhf_type != 'gkd':
+            if key == 'teacher' and not (args.rlhf_type == 'gkd'
+                                         or (args.rlhf_type == 'grpo' and args.loss_type == 'grade_gated')):
                 continue
             model_key = 'reward' if key == 'value' else key
             model_type = getattr(args, f'{model_key}_model_type')
@@ -233,6 +237,13 @@ class SwiftRLHF(SwiftSft):
             if self.args.chord_sft_dataset:
                 trainer_kwargs['chord_sft_dataset'], _ = self._prepare_chord_sft_dataset()
         if self.args.rlhf_type == 'gkd':
+            if self.args.teacher_deepspeed:
+                trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
+            trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
+            if self.args.teacher_model_server:
+                trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
+            trainer_kwargs['teacher_use_disable_adapter'] = getattr(self.args, '_teacher_use_disable_adapter', False)
+        if self.args.rlhf_type == 'grpo' and self.args.loss_type == 'grade_gated':
             if self.args.teacher_deepspeed:
                 trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
             trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk

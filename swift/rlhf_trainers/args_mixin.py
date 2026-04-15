@@ -363,6 +363,8 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     advantage_estimator: Literal['grpo', 'rloo', 'reinforce_plus_plus'] = 'grpo'
     # If false, add KL into loss, otherwise add into reward
     kl_in_reward: Optional[bool] = None  # rloo/reinforce_plus_plus: true, grpo: false (default)
+    # Additional ref-vocab tokens for GRPO ref KL surrogate. 0 keeps the original sampled-token-only behavior.
+    ref_kl_extra_vocab_topk: int = 0
 
     # REAL https://arxiv.org/abs/2602.05630
     real_tau: float = 0.5
@@ -385,3 +387,20 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # and mask sequences where this delta > threshold AND advantage < 0
     # Falls back to old_per_token_logps if rollout_per_token_logps is not available
     off_policy_sequence_mask_delta: Optional[float] = None
+
+    # GRADE-Gated
+    grade_alpha_granularity: Literal['group', 'sample'] = 'group'
+    grade_alpha_mapping: Literal['linear', 'piecewise', 'sigmoid'] = 'linear'
+    grade_alpha_piecewise_low: float = 0.25
+    grade_alpha_piecewise_high: float = 0.75
+    grade_alpha_sigmoid_temperature: float = 10.0
+    grade_reward_norm: Literal['group_minmax', 'fixed_range', 'ema'] = 'group_minmax'
+    grade_reward_min: float = 0.0
+    grade_reward_max: float = 1.0
+    grade_reward_ema_decay: float = 0.99
+    grade_reward_ema_eps: float = 1e-6
+    grade_reward_ema_clip: float = 3.0
+    grade_opd_loss_type: Literal['forward_kl', 'reverse_kl'] = 'forward_kl'
+    grade_credit_scale: float = 1.0
+    grade_credit_clip: float = 0.2
+    grade_entropy_eps: float = 1e-6

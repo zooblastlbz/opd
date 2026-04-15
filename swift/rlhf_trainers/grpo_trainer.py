@@ -34,6 +34,7 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from accelerate.utils import gather, gather_object, is_peft_model, set_seed
 from collections import defaultdict, deque
@@ -61,6 +62,8 @@ from swift.utils import (JsonlWriter, get_cu_seqlens_from_position_ids, get_logg
                          start_event_loop_in_daemon, to_device, unwrap_model_for_generation)
 from .arguments import GRPOConfig
 from .rollout_mixin import DataType, RolloutTrainerMixin
+from .teacher_utils import (TeacherOutput, approximate_entropy_from_topk_logprobs, build_opsd_teacher_data,
+                            fetch_teacher_logprobs, logp_surrogate_kl, teacher_student_kl_loss)
 from .utils import (_ForwardRedirection, compute_chord_loss, get_even_process_data, identity_data_collator,
                     load_pil_img, make_chord_sft_dataset, nanstd, pad_logps_back_to_batch, patch_save_last_checkpoint,
                     profiling_context, profiling_decorator, replace_assistant_response_with_ids)
@@ -103,9 +106,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         self.vllm_client = kwargs.pop('vllm_client', None)
         self.chord_sft_dataset = kwargs.pop('chord_sft_dataset', None)
+        teacher_model = kwargs.pop('teacher_model', None)
+        teacher_deepspeed_config = kwargs.pop('teacher_deepspeed_config', None)
+        self.teacher_model_server = kwargs.pop('teacher_model_server', None)
+        self.gkd_logits_topk = kwargs.pop('gkd_logits_topk', None)
+        teacher_use_disable_adapter = kwargs.pop('teacher_use_disable_adapter', False)
         reward_templates = kwargs.pop('reward_template', None)
         self._prepare_algorithm_params()
         super().__init__(model, ref_model, *_args, **kwargs)
+        self._prepare_teacher(teacher_model, teacher_deepspeed_config, teacher_use_disable_adapter)
         self._prepare_chord_dataset()
         self.prepare_rollout()
         self._prepare_rewards(reward_funcs, reward_model, reward_templates)
@@ -162,6 +171,36 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
         self._current_train_step_time = 0.0
+
+    def _prepare_teacher(self, teacher_model, teacher_deepspeed_config, teacher_use_disable_adapter: bool):
+        self.teacher_ds3_gather_for_generation = self.args.ds3_gather_for_generation
+        self.is_teacher_ds3 = None
+        self._teacher_use_disable_adapter = teacher_use_disable_adapter
+        self.use_teacher_api = self.teacher_model_server is not None
+        self._is_self_distillation = (teacher_model is None and self.teacher_model_server is None)
+
+        if teacher_model is not None:
+            if self.is_deepspeed_enabled:
+                if teacher_deepspeed_config is not None:
+                    self.is_teacher_ds3 = teacher_deepspeed_config.get('zero_optimization', {}).get('stage') == 3
+                    self.teacher_model = prepare_deepspeed(
+                        teacher_model,
+                        self.accelerator,
+                        deepspeed_config=teacher_deepspeed_config,
+                        training_args=self.args,
+                    )
+                else:
+                    self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                from .utils import prepare_fsdp
+                self.teacher_model = prepare_fsdp(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.teacher_model.eval()
+            if self.args.offload_teacher_model:
+                self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+        else:
+            self.teacher_model = None
 
     def _get_data_collator(self, args, template):
         return identity_data_collator
@@ -243,6 +282,26 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         batch_encoded_inputs = self._prepare_batch_inputs(inputs)
 
+        if self.grade_gated_enabled:
+            total_gate_signal, total_reward_norm, total_alpha, grade_norm_metrics = self._compute_grade_reward_norm_and_alpha(
+                inputs, total_rewards_per_func)
+            self._latest_grade_norm_metrics = grade_norm_metrics
+            teacher_mode = self.grade_teacher_mode
+            if all('teacher_prompt' in inp and inp['teacher_prompt'] for inp in inputs):
+                teacher_mode = f'{teacher_mode}_opsd'
+            local_gate_signal = get_even_process_data(self, total_gate_signal)
+            local_reward_norm = get_even_process_data(self, total_reward_norm)
+            local_alpha = get_even_process_data(self, total_alpha)
+            assert len(local_gate_signal) == len(local_reward_norm) == len(inputs) == len(local_alpha)
+            for i, (gate_signal, reward_norm, alpha) in enumerate(zip(local_gate_signal, local_reward_norm, local_alpha)):
+                inputs[i]['grade_gate_signal'] = gate_signal
+                inputs[i]['grade_reward_norm'] = reward_norm
+                inputs[i]['grade_alpha'] = alpha
+            self._logs['gate_signal'].extend(total_gate_signal.tolist())
+            self._logs['reward_norm'].extend(total_reward_norm.tolist())
+            self._logs['alpha'].extend(total_alpha.tolist())
+            self._logs['teacher_mode'].extend([teacher_mode] * len(total_alpha))
+
         total_advantages = self._compute_advantages(inputs, total_rewards_per_func, batch_encoded_inputs)
 
         local_advantages = get_even_process_data(self, total_advantages)
@@ -261,6 +320,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Advantages are always [batch_size], will be broadcast to [batch_size, seq_len] in loss computation
             all_advantages = torch.stack([data['advantages'] for data in batch])
             batch_encoded['advantages'] = all_advantages
+            if self.grade_gated_enabled:
+                batch_encoded['grade_gate_signal'] = torch.stack([data['grade_gate_signal'] for data in batch])
+                batch_encoded['grade_reward_norm'] = torch.stack([data['grade_reward_norm'] for data in batch])
+                batch_encoded['grade_alpha'] = torch.stack([data['grade_alpha'] for data in batch])
 
         with profiling_context(self, 'log_metrics'):
             # --- logs (prompts + completions) ---
@@ -772,6 +835,179 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             return rewards_std
 
+    def _map_grade_alpha(self, reward_norm: torch.Tensor) -> torch.Tensor:
+        if self.grade_alpha_mapping == 'linear':
+            return reward_norm
+        if self.grade_alpha_mapping == 'piecewise':
+            low = self.grade_alpha_piecewise_low
+            high = self.grade_alpha_piecewise_high
+            alpha = (reward_norm - low) / (high - low)
+            return alpha.clamp(0.0, 1.0)
+        if self.grade_alpha_mapping == 'sigmoid':
+            return torch.sigmoid(self.grade_alpha_sigmoid_temperature * (reward_norm - 0.5))
+        raise ValueError(f'Unknown grade_alpha_mapping: {self.grade_alpha_mapping}')
+
+    def _compute_grade_gate_signal(self, inputs: DataType, rewards: torch.Tensor) -> torch.Tensor:
+        device = rewards.device
+        if not self.dynamic_num_samples:
+            mode = 'train' if self.model.training else 'eval'
+            num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+            if self.grade_alpha_granularity == 'sample':
+                return rewards
+            grouped_rewards = rewards.view(-1, num_generations)
+            return grouped_rewards.mean(dim=1).repeat_interleave(num_generations)
+
+        prompt_ids = gather_object([inp['prompt_id'] for inp in inputs])
+        request_ids = gather_object([inp['request_id'] for inp in inputs])
+        unique_indices = self._get_last_indices(request_ids)
+        unique_request_ids = [request_ids[i] for i in unique_indices.cpu()]
+        unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
+        unique_rewards = rewards[unique_indices]
+
+        prompt_to_indices = {}
+        for idx, pid in enumerate(unique_prompt_ids):
+            prompt_to_indices.setdefault(pid, []).append(idx)
+
+        unique_signal = torch.zeros(len(unique_rewards), device=device)
+        for idxs in prompt_to_indices.values():
+            idx_tensor = torch.tensor(idxs, device=device)
+            reward_group = unique_rewards[idx_tensor]
+            if self.grade_alpha_granularity == 'sample':
+                signal_group = reward_group
+            else:
+                signal_group = reward_group.mean().expand_as(reward_group)
+            unique_signal[idx_tensor] = signal_group
+
+        rid_to_idx = {rid: idx for idx, rid in enumerate(unique_request_ids)}
+        indices_in_unique = torch.tensor([rid_to_idx[r] for r in request_ids], device=device)
+        return unique_signal[indices_in_unique]
+
+    def _compute_grade_group_minmax_reward_norm(self, inputs: DataType, rewards: torch.Tensor) -> torch.Tensor:
+        device = rewards.device
+        if not self.dynamic_num_samples:
+            mode = 'train' if self.model.training else 'eval'
+            num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+            grouped_rewards = rewards.view(-1, num_generations)
+            group_min = grouped_rewards.min(dim=1, keepdim=True).values
+            group_max = grouped_rewards.max(dim=1, keepdim=True).values
+            zero_var = torch.isclose(group_max, group_min)
+            reward_norm = (grouped_rewards - group_min) / (group_max - group_min).clamp(min=1e-12)
+            reward_norm = torch.where(zero_var, torch.full_like(reward_norm, 0.5), reward_norm)
+            return reward_norm.view(-1)
+
+        prompt_ids = gather_object([inp['prompt_id'] for inp in inputs])
+        request_ids = gather_object([inp['request_id'] for inp in inputs])
+        unique_indices = self._get_last_indices(request_ids)
+        unique_request_ids = [request_ids[i] for i in unique_indices.cpu()]
+        unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
+        unique_rewards = rewards[unique_indices]
+
+        prompt_to_indices = {}
+        for idx, pid in enumerate(unique_prompt_ids):
+            prompt_to_indices.setdefault(pid, []).append(idx)
+
+        unique_reward_norm = torch.zeros(len(unique_rewards), device=device)
+        for idxs in prompt_to_indices.values():
+            idx_tensor = torch.tensor(idxs, device=device)
+            reward_group = unique_rewards[idx_tensor]
+            group_min = reward_group.min()
+            group_max = reward_group.max()
+            if torch.isclose(group_max, group_min):
+                norm_group = torch.full_like(reward_group, 0.5)
+            else:
+                norm_group = (reward_group - group_min) / (group_max - group_min)
+            unique_reward_norm[idx_tensor] = norm_group
+
+        rid_to_idx = {rid: idx for idx, rid in enumerate(unique_request_ids)}
+        indices_in_unique = torch.tensor([rid_to_idx[r] for r in request_ids], device=device)
+        return unique_reward_norm[indices_in_unique]
+
+    def _compute_grade_group_alpha_from_norm(self, inputs: DataType, reward_norm: torch.Tensor) -> torch.Tensor:
+        device = reward_norm.device
+        if not self.dynamic_num_samples:
+            mode = 'train' if self.model.training else 'eval'
+            num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+            group_alpha = self._map_grade_alpha(reward_norm.view(-1, num_generations).mean(dim=1))
+            return group_alpha.repeat_interleave(num_generations)
+
+        prompt_ids = gather_object([inp['prompt_id'] for inp in inputs])
+        request_ids = gather_object([inp['request_id'] for inp in inputs])
+        unique_indices = self._get_last_indices(request_ids)
+        unique_request_ids = [request_ids[i] for i in unique_indices.cpu()]
+        unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
+        unique_reward_norm = reward_norm[unique_indices]
+
+        prompt_to_indices = {}
+        for idx, pid in enumerate(unique_prompt_ids):
+            prompt_to_indices.setdefault(pid, []).append(idx)
+
+        unique_alpha = torch.zeros(len(unique_reward_norm), device=device)
+        for idxs in prompt_to_indices.values():
+            idx_tensor = torch.tensor(idxs, device=device)
+            alpha_group = self._map_grade_alpha(unique_reward_norm[idx_tensor].mean()).expand(len(idxs))
+            unique_alpha[idx_tensor] = alpha_group
+
+        rid_to_idx = {rid: idx for idx, rid in enumerate(unique_request_ids)}
+        indices_in_unique = torch.tensor([rid_to_idx[r] for r in request_ids], device=device)
+        return unique_alpha[indices_in_unique]
+
+    def _normalize_grade_gate_signal(self, gate_signal: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if self.grade_reward_norm == 'fixed_range':
+            denom = max(self.grade_reward_max - self.grade_reward_min, 1e-12)
+            reward_norm = (gate_signal - self.grade_reward_min) / denom
+            return reward_norm.clamp(0.0, 1.0), {}
+
+        if self.grade_reward_norm == 'ema':
+            batch_mean = gate_signal.detach().mean()
+            batch_sq_mean = gate_signal.detach().pow(2).mean()
+            if self._grade_reward_ema_mean is None or self._grade_reward_ema_sq_mean is None:
+                mean_for_norm = batch_mean
+                sq_mean_for_norm = batch_sq_mean
+            else:
+                mean_for_norm = self._grade_reward_ema_mean
+                sq_mean_for_norm = self._grade_reward_ema_sq_mean
+
+            variance_for_norm = torch.clamp(sq_mean_for_norm - mean_for_norm.pow(2), min=0.0)
+            std_for_norm = variance_for_norm.sqrt().clamp(min=self.grade_reward_ema_eps)
+            z_score = (gate_signal - mean_for_norm) / std_for_norm
+            z_score = z_score.clamp(-self.grade_reward_ema_clip, self.grade_reward_ema_clip)
+            reward_norm = torch.sigmoid(z_score)
+
+            if self.model.training:
+                if self._grade_reward_ema_mean is None or self._grade_reward_ema_sq_mean is None:
+                    self._grade_reward_ema_mean = batch_mean
+                    self._grade_reward_ema_sq_mean = batch_sq_mean
+                else:
+                    decay = self.grade_reward_ema_decay
+                    self._grade_reward_ema_mean = decay * self._grade_reward_ema_mean + (1.0 - decay) * batch_mean
+                    self._grade_reward_ema_sq_mean = (
+                        decay * self._grade_reward_ema_sq_mean + (1.0 - decay) * batch_sq_mean)
+
+            return reward_norm, {
+                'ema_mean': mean_for_norm.item(),
+                'ema_std': std_for_norm.item(),
+            }
+
+        raise ValueError(f'Unknown grade_reward_norm strategy: {self.grade_reward_norm}')
+
+    def _compute_grade_reward_norm_and_alpha(self, inputs: DataType,
+                                             rewards_per_func: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
+                                                                                      torch.Tensor, Dict[str, float]]:
+        rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+        gate_signal = self._compute_grade_gate_signal(inputs, rewards)
+        norm_metrics: Dict[str, float] = {}
+
+        if self.grade_reward_norm == 'group_minmax':
+            reward_norm = self._compute_grade_group_minmax_reward_norm(inputs, rewards)
+            if self.grade_alpha_granularity == 'group':
+                alpha = self._compute_grade_group_alpha_from_norm(inputs, reward_norm)
+            else:
+                alpha = self._map_grade_alpha(reward_norm)
+        else:
+            reward_norm, norm_metrics = self._normalize_grade_gate_signal(gate_signal)
+            alpha = self._map_grade_alpha(reward_norm)
+        return gate_signal, reward_norm, alpha, norm_metrics
+
     def split_by_mini_batches(self, inputs: DataType) -> List[DataType]:
         """
         Split inputs into mini-batches, handling variable generation counts.
@@ -855,6 +1091,39 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             if self.ref_adapter_name:
                 self.model.set_adapter(self.model_adapter_name or 'default')
 
+    def _prepare_grade_teacher_batch_inputs(self, batch: DataType) -> Optional[DataType]:
+        teacher_data = build_opsd_teacher_data(batch)
+        if teacher_data is None:
+            return None
+
+        with self._template_context(self.template):
+            for i, teacher_item in enumerate(teacher_data):
+                student_item = batch[i]
+                messages = student_item.get('messages', [])
+                if messages and messages[-1].get('role') == 'assistant':
+                    teacher_item['messages'].append(dict(messages[-1]))
+                if 'response_token_ids' in student_item and student_item['response_token_ids']:
+                    teacher_item['response_token_ids'] = student_item['response_token_ids']
+                    if 'response_loss_mask' in student_item and student_item['response_loss_mask']:
+                        teacher_item['response_loss_mask'] = student_item['response_loss_mask']
+                    teacher_item['messages'] = replace_assistant_response_with_ids(
+                        teacher_item['messages'],
+                        teacher_item['response_token_ids'],
+                        teacher_item.get('response_loss_mask'),
+                    )
+                teacher_item['add_eos'] = False
+
+            batch_encoded = [self.template.encode(data, return_length=True) for data in teacher_data]
+            return to_device(self.template.data_collator(batch_encoded), self.model.device)
+
+    def _fetch_grade_teacher_logprobs_from_api(self, source_input_ids: torch.Tensor):
+        teacher_logprobs, teacher_indices = fetch_teacher_logprobs(
+            self.teacher_model_server,
+            source_input_ids.tolist(),
+            topk=self.gkd_logits_topk,
+        )
+        return teacher_logprobs.to(source_input_ids.device), teacher_indices.to(source_input_ids.device)
+
     @profiling_decorator
     def _prepare_batch_inputs(self, inputs: DataType) -> List[DataType]:
         """
@@ -933,17 +1202,27 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
                 batch_encoded_inputs['old_per_token_logps'] = (
                     self._get_per_token_logps_and_entropies(self.model, batch_encoded_inputs)[0])
+                ref_extra_token_ids = None
+                ref_extra_token_logps = None
                 if self.beta == 0.0:
                     ref_per_token_logps = None
                 elif self.ref_model is not None:
                     with disable_gradient_checkpointing(self.ref_model, self.args.gradient_checkpointing_kwargs):
                         ref_per_token_logps = \
                             self._get_per_token_logps_and_entropies(self.ref_model, batch_encoded_inputs)[0]
+                        if self.ref_kl_extra_vocab_topk > 0:
+                            ref_extra_token_ids, ref_extra_token_logps = self._get_ref_extra_vocab_topk_data(
+                                self.ref_model, batch_encoded_inputs, self.ref_kl_extra_vocab_topk)
                 else:
                     with self.null_ref_context():
                         ref_per_token_logps = \
                             self._get_per_token_logps_and_entropies(self.model, batch_encoded_inputs)[0]
+                        if self.ref_kl_extra_vocab_topk > 0:
+                            ref_extra_token_ids, ref_extra_token_logps = self._get_ref_extra_vocab_topk_data(
+                                self.model, batch_encoded_inputs, self.ref_kl_extra_vocab_topk)
                 batch_encoded_inputs['ref_per_token_logps'] = ref_per_token_logps
+                batch_encoded_inputs['ref_extra_token_ids'] = ref_extra_token_ids
+                batch_encoded_inputs['ref_extra_token_logps'] = ref_extra_token_logps
 
                 # Extract rollout logprobs if available for importance sampling
                 # rollout_logprobs is List[List[float]] - nested list where each inner list corresponds to
@@ -1003,6 +1282,35 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
                             batch_encoded_inputs['rollout_per_token_logps'] = rollout_logps_tensor
 
+                if self.grade_gated_enabled:
+                    teacher_batch_inputs = self._prepare_grade_teacher_batch_inputs(batch)
+                    if teacher_batch_inputs is not None:
+                        for key, value in teacher_batch_inputs.items():
+                            batch_encoded_inputs[f'grade_teacher_{key}'] = value
+
+                    if self.use_teacher_api:
+                        if teacher_batch_inputs is not None:
+                            source_input_ids = teacher_batch_inputs['input_ids']
+                            teacher_logprobs, teacher_indices = self._fetch_grade_teacher_logprobs_from_api(
+                                source_input_ids)
+                            teacher_labels = teacher_batch_inputs['labels']
+                            teacher_logits_to_keep = (
+                                teacher_labels.shape[-1] - (torch.ne(teacher_labels, -100).int().argmax(-1))).max()
+                            teacher_logits_to_keep = int(teacher_logits_to_keep.item())
+                            batch_encoded_inputs['grade_teacher_completion_mask'] = (
+                                teacher_labels[:, -teacher_logits_to_keep:] != -100)
+                            batch_encoded_inputs['grade_teacher_topk_logprobs'] = teacher_logprobs[
+                                :, -teacher_logits_to_keep:, :]
+                            batch_encoded_inputs['grade_teacher_topk_indices'] = teacher_indices[
+                                :, -teacher_logits_to_keep:, :]
+                        else:
+                            source_input_ids = batch_encoded_inputs['input_ids']
+                            teacher_logprobs, teacher_indices = self._fetch_grade_teacher_logprobs_from_api(
+                                source_input_ids)
+                            batch_encoded_inputs['grade_teacher_topk_logprobs'] = teacher_logprobs[
+                                :, -logits_to_keep:, :]
+                            batch_encoded_inputs['grade_teacher_topk_indices'] = teacher_indices[:, -logits_to_keep:, :]
+
             ga_batch_encoded_inputs.append(batch_encoded_inputs)
 
         # --- log completion lengths ---
@@ -1057,6 +1365,187 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             res = self.template.encode(template_inputs)
             prompts_text.append(self.template.safe_decode(res['input_ids']))
         return prompts_text
+
+    def _extract_prefixed_model_inputs(self, inputs: DataType, prefix: str) -> Dict[str, Any]:
+        prefix_len = len(prefix)
+        model_inputs = {}
+        for key, value in inputs.items():
+            if key.startswith(prefix) and key != f'{prefix}labels':
+                model_inputs[key[prefix_len:]] = value
+        return model_inputs
+
+    def _forward_completion_logits(self,
+                                   model: torch.nn.Module,
+                                   inputs: DataType,
+                                   *,
+                                   prefix: Optional[str] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if prefix is None:
+            model_inputs = self._prepare_model_inputs(inputs)
+            logits_to_keep = inputs['logits_to_keep']
+            completion_mask = inputs['completion_mask']
+        else:
+            labels = inputs[f'{prefix}labels']
+            logits_to_keep = labels.shape[-1] - (torch.ne(labels, -100).int().argmax(-1))
+            logits_to_keep = int(logits_to_keep.max().item())
+            completion_mask = labels[:, -logits_to_keep:] != -100
+            model_inputs = self._extract_prefixed_model_inputs(inputs, prefix)
+
+        if 'logits_to_keep' in self.model_kwarg_keys:
+            model_inputs['logits_to_keep'] = logits_to_keep + 1
+        logits = model(**model_inputs).logits
+        completion_logits = logits[:, -(logits_to_keep + 1):-1, :]
+        return completion_logits, completion_mask
+
+    def _get_grade_teacher_output(self, model: torch.nn.Module, inputs: DataType,
+                                  student_completion_mask: torch.Tensor):
+        if self.use_teacher_api:
+            teacher_output = TeacherOutput(
+                topk_logprobs=inputs['grade_teacher_topk_logprobs'],
+                topk_indices=inputs['grade_teacher_topk_indices'],
+            )
+            teacher_completion_mask = inputs.get('grade_teacher_completion_mask', student_completion_mask)
+            if teacher_completion_mask.shape != student_completion_mask.shape:
+                raise ValueError('Teacher completion mask shape does not match student completion mask for grade_gated.')
+            if not torch.equal(teacher_completion_mask.sum(dim=1), student_completion_mask.sum(dim=1)):
+                raise ValueError('Teacher and student completion token counts must match for grade_gated.')
+            teacher_entropy = approximate_entropy_from_topk_logprobs(teacher_output.topk_logprobs)
+            return teacher_output, teacher_entropy, True
+
+        prefix = 'grade_teacher_' if 'grade_teacher_input_ids' in inputs else None
+        teacher_model = model if self._is_self_distillation else self.teacher_model
+        adapter_ctx = (self.accelerator.unwrap_model(model).disable_adapter()
+                       if self._teacher_use_disable_adapter else nullcontext())
+        load_context = self.load_teacher_model_context() if (teacher_model is self.teacher_model
+                                                             and self.args.offload_teacher_model) else nullcontext()
+        with torch.no_grad(), load_context, adapter_ctx, disable_gradient_checkpointing(
+                teacher_model, self.args.gradient_checkpointing_kwargs):
+            teacher_logits, teacher_completion_mask = self._forward_completion_logits(teacher_model, inputs, prefix=prefix)
+        if teacher_completion_mask.shape != student_completion_mask.shape:
+            raise ValueError('Teacher completion mask shape does not match student completion mask for grade_gated.')
+        if not torch.equal(teacher_completion_mask.sum(dim=1), student_completion_mask.sum(dim=1)):
+            raise ValueError('Teacher and student completion token counts must match for grade_gated.')
+        teacher_entropy = entropy_from_logits(teacher_logits)
+        return TeacherOutput(full_logits=teacher_logits), teacher_entropy, False
+
+    def _compute_grade_token_advantages(self,
+                                        advantages: torch.Tensor,
+                                        student_entropies: torch.Tensor,
+                                        teacher_entropies: torch.Tensor,
+                                        completion_mask: torch.Tensor,
+                                        vocab_size: int):
+        entropy_eps = self.grade_entropy_eps
+        h_max = torch.log(torch.tensor(float(vocab_size), device=student_entropies.device))
+        positive_credit = torch.clamp(student_entropies - teacher_entropies, min=0.0) / (
+            student_entropies + entropy_eps)
+        negative_credit = (h_max - student_entropies) / h_max.clamp(min=entropy_eps)
+        positive_credit = torch.where(completion_mask, positive_credit, torch.zeros_like(positive_credit))
+        negative_credit = torch.where(completion_mask, negative_credit, torch.zeros_like(negative_credit))
+        g_credit = torch.where(advantages.unsqueeze(1) > 0, positive_credit, negative_credit)
+        credit_factor = torch.clamp(
+            1.0 + self.grade_credit_scale * g_credit,
+            1.0 - self.grade_credit_clip,
+            1.0 + self.grade_credit_clip,
+        )
+        token_advantages = advantages.unsqueeze(1) * credit_factor
+        token_advantages = torch.where(completion_mask, token_advantages, torch.zeros_like(token_advantages))
+        return token_advantages, g_credit
+
+    def _compute_grade_gated_loss(self, model: torch.nn.Module, inputs: DataType, coef_1: torch.Tensor,
+                                  per_token_kl: Optional[torch.Tensor], completion_mask: torch.Tensor,
+                                  entropy_mask: Optional[torch.Tensor]):
+        student_logits, _ = self._forward_completion_logits(model, inputs)
+        student_entropies = entropy_from_logits(student_logits)
+        teacher_output, teacher_entropies, teacher_entropy_is_approx = self._get_grade_teacher_output(
+            model, inputs, completion_mask)
+        token_advantages, credit_scores = self._compute_grade_token_advantages(
+            inputs['advantages'], student_entropies, teacher_entropies, completion_mask, student_logits.shape[-1])
+
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+        if self.args.delta is not None:
+            coef_1 = torch.clamp(coef_1, max=self.args.delta)
+        per_token_loss = -torch.min(coef_1 * token_advantages, coef_2 * token_advantages)
+        if per_token_kl is not None:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+        if inputs.get('rollout_is_weights') is not None and self.rollout_importance_sampling_mode is not None:
+            per_token_loss = per_token_loss * inputs['rollout_is_weights']
+
+        grade_mask = completion_mask if entropy_mask is None else (completion_mask & entropy_mask)
+        grade_mask = grade_mask.bool()
+        grpo_component_loss = (per_token_loss * grade_mask).sum(-1) / grade_mask.sum(-1).clamp(min=1.0)
+
+        divergence_labels = torch.full_like(grade_mask, -100, dtype=torch.long)
+        divergence_labels[grade_mask] = 0
+        teacher_output.validate()
+        if teacher_output.is_topk_mode:
+            opd_component_loss = teacher_student_kl_loss(
+                student_logits=student_logits,
+                labels=divergence_labels,
+                temperature=self.temperature,
+                teacher_topk_logprobs=teacher_output.topk_logprobs,
+                teacher_topk_indices=teacher_output.topk_indices,
+                direction=self.grade_opd_loss_type,
+                return_per_sequence=True,
+            )
+        else:
+            opd_component_loss = teacher_student_kl_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_output.full_logits,
+                labels=divergence_labels,
+                temperature=self.temperature,
+                topk=self.gkd_logits_topk,
+                direction=self.grade_opd_loss_type,
+                return_per_sequence=True,
+            )
+
+        alpha = inputs['grade_alpha'].to(grpo_component_loss.dtype)
+        combined_loss = alpha * grpo_component_loss + (1.0 - alpha) * opd_component_loss
+
+        valid_credit = credit_scores[completion_mask]
+        valid_teacher_entropy = teacher_entropies[completion_mask]
+        gathered_alpha = self.accelerator.gather_for_metrics(inputs['grade_alpha']).float()
+        gathered_gate_signal = self.accelerator.gather_for_metrics(inputs['grade_gate_signal']).float()
+        gathered_reward_norm = self.accelerator.gather_for_metrics(inputs['grade_reward_norm']).float()
+        gathered_grpo_component = self.accelerator.gather_for_metrics(grpo_component_loss).float()
+        gathered_opd_component = self.accelerator.gather_for_metrics(opd_component_loss).float()
+
+        if valid_teacher_entropy.numel() > 0:
+            teacher_entropy_mean = self.accelerator.gather_for_metrics(valid_teacher_entropy).float().mean().item()
+        else:
+            teacher_entropy_mean = 0.0
+        if valid_credit.numel() > 0:
+            gathered_credit = self.accelerator.gather_for_metrics(valid_credit).float()
+            credit_mean = gathered_credit.mean().item()
+            credit_max = gathered_credit.max().item()
+        else:
+            credit_mean = 0.0
+            credit_max = 0.0
+        metrics = {
+            'alpha_mean': gathered_alpha.mean().item(),
+            'alpha_min': gathered_alpha.min().item(),
+            'alpha_max': gathered_alpha.max().item(),
+            'gate_signal_mean': gathered_gate_signal.mean().item(),
+            'gate_signal_min': gathered_gate_signal.min().item(),
+            'gate_signal_max': gathered_gate_signal.max().item(),
+            'reward_norm_mean': gathered_reward_norm.mean().item(),
+            'grpo_component_loss': gathered_grpo_component.mean().item(),
+            'opd_component_loss': gathered_opd_component.mean().item(),
+            'teacher_entropy_mean': teacher_entropy_mean,
+            'credit_mean': credit_mean,
+            'credit_max': credit_max,
+            'teacher_entropy_is_approx': float(teacher_entropy_is_approx),
+        }
+        metrics.update(self._latest_grade_norm_metrics)
+        return combined_loss.mean(), per_token_loss, metrics
+
+    @contextmanager
+    def load_teacher_model_context(self):
+        if not self.args.offload_teacher_model or self.teacher_model is None:
+            yield
+            return
+
+        self.load_model(self.accelerator.unwrap_model(self.teacher_model))
+        yield
+        self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1132,8 +1621,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Only compute KL for loss if kl_in_reward=False (GRPO style)
         if self.beta != 0.0 and not self.kl_in_reward:
             ref_per_token_logps = inputs['ref_per_token_logps']
-            safe_ratio = torch.clamp(ref_per_token_logps - per_token_logps, min=-20, max=20)
-            per_token_kl = torch.clamp(torch.exp(safe_ratio) - safe_ratio - 1, min=-10, max=10)
+            extra_ref_logps = inputs.get('ref_extra_token_logps')
+            extra_model_logps = None
+            if extra_ref_logps is not None:
+                extra_model_logps = self._get_selected_token_logps(model, inputs, inputs.get('ref_extra_token_ids'))
+            per_token_kl = logp_surrogate_kl(
+                ref_logps=ref_per_token_logps,
+                model_logps=per_token_logps,
+                extra_ref_logps=extra_ref_logps,
+                extra_model_logps=extra_model_logps,
+            )
         else:
             per_token_kl = None
 
@@ -1191,37 +1688,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         coef_1 = torch.exp(log_importance_weights)
 
-        if self.loss_type == 'cispo':
-            clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
-            per_token_loss = -clamped_ratios * advantages.unsqueeze(1) * per_token_logps
-        elif self.loss_type == 'sapo':
-            advantages_expanded = advantages.unsqueeze(1)
-            gate_pos = torch.sigmoid(self.tau_pos * (coef_1 - 1)) * (4.0 / self.tau_pos)
-            gate_neg = torch.sigmoid(self.tau_neg * (coef_1 - 1)) * (4.0 / self.tau_neg)
-            is_positive = advantages_expanded > 0
-            soft_gate = torch.where(is_positive, gate_pos, gate_neg)
-
-            per_token_loss = -soft_gate * advantages_expanded
-        elif self.loss_type == 'real':
-            per_token_loss = torch.zeros_like(per_token_logps)
-        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo']:
-            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-            if self.args.delta is not None:
-                coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        if entropy_mask is not None:
-            per_token_loss = per_token_loss * entropy_mask
-        if per_token_kl is not None:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        # Apply vLLM importance sampling weights if available
-        if inputs.get('rollout_is_weights') is not None and self.rollout_importance_sampling_mode is not None:
-            rollout_is_weights = inputs['rollout_is_weights']
-            per_token_loss = per_token_loss * rollout_is_weights
-
         # Apply off-policy sequence masking if enabled
         # Mask out sequences where delta > threshold AND advantage < 0
         if self.off_policy_sequence_mask_delta is not None:
@@ -1230,57 +1696,82 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 else old_per_token_logps
             off_policy_seq_mask = self._compute_off_policy_sequence_mask(per_token_logps, old_policy_per_token_logps,
                                                                          completion_mask, advantages)
-            # Expand sequence mask to token level and apply to completion_mask
             off_policy_seq_mask_expanded = off_policy_seq_mask.unsqueeze(-1).expand_as(completion_mask)
             completion_mask = completion_mask & off_policy_seq_mask_expanded
 
-        if self.loss_type in ['grpo', 'sapo']:
-            # completion_mask is now always [batch_size, seq_len] after pad_back
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-        elif self.loss_type == 'bnpo':
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        elif self.loss_type == 'dr_grpo':
-            batch_size = completion_mask.shape[0]
-            loss = (per_token_loss * completion_mask).sum() / (batch_size * self.max_completion_length)
-        elif self.loss_type == 'real':
-            global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-
-            group_scores = global_scores.view(-1, self.num_generations)
-            group_rewards = advantages.view(-1, self.num_generations)
-
-            pos_mask = (group_rewards > 0)
-            neg_mask = (group_rewards <= 0)
-            valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
-
-            if not valid_mask.any():
-                loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
-            else:
-                batch_scores = group_scores[valid_mask]
-                batch_pos_mask = pos_mask[valid_mask]
-                batch_neg_mask = neg_mask[valid_mask]
-
-                scaled_scores = batch_scores / self.real_tau
-                zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
-
-                # Negative Loss: log(1 + sum(e^{S_neg}))
-                neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
-                neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
-
-                # Positive Loss: log(1 + sum(e^{-S_pos}))
-                pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
-                pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
-
-                loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
-
-            if self.beta != 0.0:
-                kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-                loss = loss + kl_loss * self.beta
-        elif self.loss_type in ['cispo', 'dapo']:
-            # CISPO and DAPO: Normalize by total completion tokens across all processes
-            normalizer = inputs['num_items_in_batch'] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
+        grade_metrics = None
+        if self.grade_gated_enabled:
+            loss, per_token_loss, grade_metrics = self._compute_grade_gated_loss(
+                model, inputs, coef_1, per_token_kl, completion_mask, entropy_mask)
         else:
-            raise ValueError(f'Unknown loss type: {self.loss_type}')
+            if self.loss_type == 'cispo':
+                clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
+                per_token_loss = -clamped_ratios * advantages.unsqueeze(1) * per_token_logps
+            elif self.loss_type == 'sapo':
+                advantages_expanded = advantages.unsqueeze(1)
+                gate_pos = torch.sigmoid(self.tau_pos * (coef_1 - 1)) * (4.0 / self.tau_pos)
+                gate_neg = torch.sigmoid(self.tau_neg * (coef_1 - 1)) * (4.0 / self.tau_neg)
+                is_positive = advantages_expanded > 0
+                soft_gate = torch.where(is_positive, gate_pos, gate_neg)
+                per_token_loss = -soft_gate * advantages_expanded
+            elif self.loss_type == 'real':
+                per_token_loss = torch.zeros_like(per_token_logps)
+            elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo']:
+                coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+                if self.args.delta is not None:
+                    coef_1 = torch.clamp(coef_1, max=self.args.delta)
+                per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+                per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+                per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            else:
+                raise ValueError(f'Unknown loss type: {self.loss_type}')
+
+            if entropy_mask is not None:
+                per_token_loss = per_token_loss * entropy_mask
+            if per_token_kl is not None:
+                per_token_loss = per_token_loss + self.beta * per_token_kl
+
+            if inputs.get('rollout_is_weights') is not None and self.rollout_importance_sampling_mode is not None:
+                rollout_is_weights = inputs['rollout_is_weights']
+                per_token_loss = per_token_loss * rollout_is_weights
+
+            if self.loss_type in ['grpo', 'sapo']:
+                loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            elif self.loss_type == 'bnpo':
+                loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            elif self.loss_type == 'dr_grpo':
+                batch_size = completion_mask.shape[0]
+                loss = (per_token_loss * completion_mask).sum() / (batch_size * self.max_completion_length)
+            elif self.loss_type == 'real':
+                global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+                group_scores = global_scores.view(-1, self.num_generations)
+                group_rewards = advantages.view(-1, self.num_generations)
+                pos_mask = (group_rewards > 0)
+                neg_mask = (group_rewards <= 0)
+                valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
+
+                if not valid_mask.any():
+                    loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
+                else:
+                    batch_scores = group_scores[valid_mask]
+                    batch_pos_mask = pos_mask[valid_mask]
+                    batch_neg_mask = neg_mask[valid_mask]
+
+                    scaled_scores = batch_scores / self.real_tau
+                    zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+                    neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+                    neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+                    pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+                    pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
+                    loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
+
+                if self.beta != 0.0:
+                    kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                    loss = loss + kl_loss * self.beta
+            elif self.loss_type in ['cispo', 'dapo']:
+                normalizer = inputs['num_items_in_batch'] / self.accelerator.num_processes
+                loss = (per_token_loss * completion_mask).sum() / normalizer
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
 
@@ -1306,6 +1797,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Add rollout correction metrics
         if rollout_correction_metrics:
             metrics_data['rollout_correction'] = rollout_correction_metrics
+
+        if grade_metrics is not None:
+            metrics_data['grade'] = grade_metrics
 
         # Compute the clipped probability ratios
         if self.loss_type == 'cispo':
@@ -1365,6 +1859,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             rollout_metrics = metrics_data['rollout_correction']
             for key, value in rollout_metrics.items():
                 self._metrics[mode][f'rollout_correction/{key}'].append(value)
+
+        if 'grade' in metrics_data:
+            for key, value in metrics_data['grade'].items():
+                self._metrics[mode][f'grade/{key}'].append(value)
 
         # Update clipping metrics
         if 'clipping' in metrics_data:
@@ -1447,6 +1945,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         clip_values = {'low': [], 'high': [], 'region': [], 'low_min': [], 'high_max': []}
         cispo_clip_values = []
         entropy_thresholds = []
+        grade_values = defaultdict(list)
 
         for chunk_metrics, chunk_weight in all_metrics_data:
             chunk_tokens = chunk_metrics['completion_token_count']
@@ -1467,6 +1966,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Collect KL metrics
             if 'kl' in chunk_metrics:
                 kl_values.append(chunk_metrics['kl'])
+
+            if 'grade' in chunk_metrics:
+                for key, value in chunk_metrics['grade'].items():
+                    grade_values[key].append(value)
 
             # Collect clipping metrics (weighted by tokens)
             if 'clipping' in chunk_metrics:
@@ -1499,6 +2002,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Aggregate KL
         if kl_values:
             aggregated_metrics['kl'] = sum(kl_values) / len(kl_values)
+
+        if grade_values:
+            aggregated_metrics['grade'] = {key: sum(values) / len(values) for key, values in grade_values.items()}
 
         # Aggregate clipping (token-weighted averages)
         def weighted_avg(values):
@@ -1687,6 +2193,53 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 entropies = None
 
         return logps, entropies
+
+    def _get_logits_via_local_forward(self, model: torch.nn.Module, inputs: 'DataType') -> torch.Tensor:
+        if self.template.padding_free:
+            raise ValueError('ref_kl_extra_vocab_topk does not support padding_free yet.')
+        if self.template.sequence_parallel_size > 1:
+            raise ValueError('ref_kl_extra_vocab_topk does not support sequence parallel yet.')
+
+        logits_to_keep = inputs['logits_to_keep']
+        model_inputs = self._prepare_model_inputs(inputs)
+        if 'logits_to_keep' in self.model_kwarg_keys:
+            model_inputs['logits_to_keep'] = logits_to_keep + 1
+
+        logits = model(**model_inputs).logits
+        return logits[:, -(logits_to_keep + 1):-1, :] / self.temperature
+
+    def _get_ref_extra_vocab_topk_data(self,
+                                       model: torch.nn.Module,
+                                       inputs: 'DataType',
+                                       extra_topk: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if extra_topk <= 0:
+            return None, None
+
+        logits = self._get_logits_via_local_forward(model, inputs)
+        vocab_size = logits.shape[-1]
+        available_topk = min(extra_topk, max(vocab_size - 1, 0))
+        if available_topk == 0:
+            empty_shape = (*logits.shape[:2], 0)
+            return logits.new_empty(empty_shape, dtype=torch.long), logits.new_empty(empty_shape)
+
+        input_ids_for_logps = inputs['input_ids'][:, -inputs['logits_to_keep']:]
+        log_probs = F.log_softmax(logits, dim=-1)
+        masked_log_probs = log_probs.scatter(-1, input_ids_for_logps.unsqueeze(-1), float('-inf'))
+        extra_logps, extra_ids = torch.topk(masked_log_probs, k=available_topk, dim=-1)
+        return extra_ids, extra_logps
+
+    def _get_selected_token_logps(self,
+                                  model: torch.nn.Module,
+                                  inputs: 'DataType',
+                                  token_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if token_ids is None:
+            return None
+        if token_ids.numel() == 0 or token_ids.shape[-1] == 0:
+            return token_ids.new_empty(token_ids.shape, dtype=torch.float32)
+
+        logits = self._get_logits_via_local_forward(model, inputs)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return torch.gather(log_probs, dim=-1, index=token_ids)
 
     @profiling_decorator
     def _get_per_token_logps_and_entropies(self,
@@ -2175,6 +2728,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'rewards': defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             'advantages': deque(maxlen=args.generation_batch_size),
         }
+        if self.grade_gated_enabled:
+            self._logs.update({
+                'alpha': deque(maxlen=args.generation_batch_size),
+                'gate_signal': deque(maxlen=args.generation_batch_size),
+                'reward_norm': deque(maxlen=args.generation_batch_size),
+                'teacher_mode': deque(maxlen=args.generation_batch_size),
+            })
         self.compute_entropy = self.args.log_entropy or self.top_entropy_quantile < 1.0
         if self.args.log_entropy:
             self._logs.update({'entropy': deque(maxlen=args.generation_batch_size)})
@@ -2184,11 +2744,24 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'dynamic_sample': str(self.dynamic_sample),
             'importance_sampling_level': str(self.importance_sampling_level),
             'advantage_estimator': str(self.advantage_estimator),
+            'ref_kl_extra_vocab_topk': str(self.ref_kl_extra_vocab_topk),
             'chord_sft_enabled': str(self.chord_sft_dataset is not None),
             'offpolicy_sequence_mask': 'enable' if self.off_policy_sequence_mask_delta is not None else 'disable',
             'rollout_importance_sampling': 'enable' if self.rollout_importance_sampling_mode is not None else 'disable',
             'loss_type': str(self.loss_type),
+            'grade_gated_enabled': str(self.grade_gated_enabled),
         }
+        if self.grade_gated_enabled:
+            config.update({
+                'grade_alpha_granularity': str(self.grade_alpha_granularity),
+                'grade_alpha_mapping': str(self.grade_alpha_mapping),
+                'grade_reward_norm': str(self.grade_reward_norm),
+                'grade_reward_min': str(self.grade_reward_min),
+                'grade_reward_max': str(self.grade_reward_max),
+                'grade_reward_ema_decay': str(self.grade_reward_ema_decay),
+                'grade_opd_loss_type': str(self.grade_opd_loss_type),
+                'grade_teacher_mode': self.grade_teacher_mode,
+            })
         return config
 
     def _prepare_algorithm_params(self):
@@ -2224,6 +2797,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # RLOO,
         self.advantage_estimator = args.advantage_estimator
         self.kl_in_reward = args.kl_in_reward
+        self.ref_kl_extra_vocab_topk = args.ref_kl_extra_vocab_topk
         if self.scale_rewards == 'gdpo' and self.kl_in_reward:
             logger.warning('GDPO mode does not support kl_in_reward=True. Setting kl_in_reward=False.')
             self.kl_in_reward = False
@@ -2235,6 +2809,32 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         # Off-Policy Sequence Masking
         self.off_policy_sequence_mask_delta = args.off_policy_sequence_mask_delta
+        self.grade_gated_enabled = args.loss_type == 'grade_gated'
+        self.grade_alpha_granularity = args.grade_alpha_granularity
+        self.grade_alpha_mapping = args.grade_alpha_mapping
+        self.grade_alpha_piecewise_low = args.grade_alpha_piecewise_low
+        self.grade_alpha_piecewise_high = args.grade_alpha_piecewise_high
+        self.grade_alpha_sigmoid_temperature = args.grade_alpha_sigmoid_temperature
+        self.grade_reward_norm = args.grade_reward_norm
+        self.grade_reward_min = args.grade_reward_min
+        self.grade_reward_max = args.grade_reward_max
+        self.grade_reward_ema_decay = args.grade_reward_ema_decay
+        self.grade_reward_ema_eps = args.grade_reward_ema_eps
+        self.grade_reward_ema_clip = args.grade_reward_ema_clip
+        self.grade_opd_loss_type = args.grade_opd_loss_type
+        self.grade_credit_scale = args.grade_credit_scale
+        self.grade_credit_clip = args.grade_credit_clip
+        self.grade_entropy_eps = args.grade_entropy_eps
+        self._grade_reward_ema_mean: Optional[torch.Tensor] = None
+        self._grade_reward_ema_sq_mean: Optional[torch.Tensor] = None
+        self._latest_grade_norm_metrics: Dict[str, float] = {}
+        if self.grade_gated_enabled:
+            if args.teacher_model_server:
+                self.grade_teacher_mode = 'teacher_server'
+            elif args.teacher_model:
+                self.grade_teacher_mode = 'teacher_model'
+            else:
+                self.grade_teacher_mode = 'self_distill'
 
     def _prepare_chord_dataset(self):
         # CHORD, https://arxiv.org/abs/2508.11408
@@ -2664,11 +3264,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         return {
             k: v
             for k, v in inputs.items() if k not in [
-                'logits_to_keep', 'completion_mask', 'ref_per_token_logps', 'advantages', 'old_per_token_logps',
-                'truncated_mask', 'seq_lengths', 'num_items_in_batch', 'rollout_per_token_logps', 'rollout_logprobs',
-                'is_truncated', 'add_eos', 'response_token_ids', 'prompt_id', 'rollout_is_weights', 'finish_reason',
-                'request_id'
-            ]
+                'logits_to_keep', 'completion_mask', 'ref_per_token_logps', 'ref_extra_token_ids',
+                'ref_extra_token_logps', 'advantages', 'old_per_token_logps', 'truncated_mask', 'seq_lengths',
+                'num_items_in_batch', 'rollout_per_token_logps', 'rollout_logprobs', 'is_truncated', 'add_eos',
+                'response_token_ids', 'prompt_id', 'rollout_is_weights', 'finish_reason', 'request_id',
+                'grade_alpha', 'grade_gate_signal', 'grade_reward_norm', 'grade_teacher_topk_logprobs',
+                'grade_teacher_topk_indices', 'grade_teacher_completion_mask'
+            ] and not k.startswith('grade_teacher_')
         }
 
     def _get_eval_sampler(self, eval_dataset):
