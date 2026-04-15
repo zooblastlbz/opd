@@ -45,6 +45,8 @@ SAVE_TOTAL_LIMIT=5
 DATALOADER_NUM_WORKERS=4
 DATASET_NUM_PROC=4
 REPORT_TO="wandb"
+WANDB_PROJECT="opd"
+RUN_NAME="qwen3_8b_opsd_dapo_math_17k"
 
 TEMPERATURE=1.2
 SLEEP_LEVEL=1
@@ -87,6 +89,7 @@ CMD=(
     --max_length "${MAX_LENGTH}"
     --max_completion_length "${MAX_COMPLETION_LENGTH}"
     --num_train_epochs "${NUM_TRAIN_EPOCHS}"
+    --run_name "${RUN_NAME}"
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE}"
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
@@ -136,6 +139,7 @@ else
 fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+WANDB_PROJECT="${WANDB_PROJECT}" \
 NPROC_PER_NODE="${NPROC_PER_NODE}" \
 NNODES="${NNODES}" \
 NODE_RANK="${NODE_RANK}" \
