@@ -63,6 +63,10 @@ INFER_BACKEND="${INFER_BACKEND:-vllm}"
 TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+if [[ -z "${SYSTEM_PROMPT}" ]]; then
+    SYSTEM_PROMPT='A conversation between User and Assistant. The user asks a math question, and the Assistant solves it. The assistant must first provide the reasoning process inside <think> </think> tags, and then provide the final answer inside <answer> </answer> tags. Put the final mathematical answer inside \boxed{} within the <answer> tag. The required format is: <think> reasoning here </think><answer> \boxed{final answer} </answer>'
+fi
+ENABLE_THINKING="${ENABLE_THINKING:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 
 contains_target() {
@@ -135,6 +139,8 @@ run_one_model() {
         --eval-num-proc "${EVAL_NUM_PROC}"
         --infer-backend "${INFER_BACKEND}"
         --torch-dtype "${TORCH_DTYPE}"
+        --system "${SYSTEM_PROMPT}"
+        --enable-thinking "${ENABLE_THINKING}"
     )
 
     if [[ -n "${adapters}" ]]; then
@@ -149,10 +155,6 @@ run_one_model() {
 
     if [[ -n "${EVAL_LIMIT}" ]]; then
         cmd+=(--eval-limit "${EVAL_LIMIT}")
-    fi
-
-    if [[ -n "${SYSTEM_PROMPT}" ]]; then
-        cmd+=(--system "${SYSTEM_PROMPT}")
     fi
 
     if [[ "${DRY_RUN}" == "true" ]]; then

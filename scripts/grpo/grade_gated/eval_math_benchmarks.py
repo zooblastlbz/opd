@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--infer-backend", default="vllm", choices=["vllm", "transformers", "sglang", "lmdeploy"])
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--system", default=None, help="Optional system prompt override.")
+    parser.add_argument("--enable-thinking", default="false", choices=["true", "false"])
     parser.add_argument(
         "--extra-eval-args",
         default='{"ignore_errors": false}',
@@ -142,6 +143,7 @@ def run_eval(args: argparse.Namespace) -> Dict[str, Any]:
         torch_dtype=args.torch_dtype,
         temperature=args.temperature,
         system=args.system,
+        enable_thinking=args.enable_thinking == "true",
         vllm_max_model_len=args.vllm_max_model_len,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
@@ -167,6 +169,8 @@ def main() -> None:
         "vllm_max_model_len": args.vllm_max_model_len,
         "eval_num_proc": args.eval_num_proc,
         "infer_backend": args.infer_backend,
+        "system": args.system,
+        "enable_thinking": args.enable_thinking == "true",
         "output_dir": str(out_dir),
     }
 

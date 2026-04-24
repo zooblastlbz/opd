@@ -41,7 +41,9 @@ SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a math q
 MODEL="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen3-8B"
 DATASET="/ytech_m2v5_hdd/workspace/kling_mm/Datasets/DAPO-Math-17k-Processed"
 VAL_DATASETS=("aime2025_i_val" "aime2025_ii_val")
-EXTERNAL_PLUGIN="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/scripts/grpo/grade_gated/aime2025_val_plugin.py"
+REWARD_PLUGIN="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/scripts/grpo/grade_gated/opd_ttrl_math_reward.py"
+VAL_PLUGIN="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/scripts/grpo/grade_gated/aime2025_val_plugin.py"
+EXTERNAL_PLUGINS=("${REWARD_PLUGIN}" "${VAL_PLUGIN}")
 OUTPUT_DIR="output/Qwen3-8B-DAPO-DAPO-Math-17k-format-len8192"
 
 TUNER_TYPE="full"
@@ -65,7 +67,8 @@ GRADIENT_ACCUMULATION_STEPS=16
 NUM_GENERATIONS=8
 NUM_GENERATIONS_EVAL=1
 LEARNING_RATE=1e-6
-WARMUP_RATIO=0.05
+LR_SCHEDULER_TYPE="constant"
+WARMUP_RATIO=0
 LOGGING_STEPS=1
 SAVE_STEPS=20
 EVAL_STEPS=20
@@ -150,11 +153,9 @@ CMD=(
     --model "${MODEL}"
     --dataset "${DATASET}"
     --val_dataset "${VAL_DATASETS[@]}"
-    --external_plugins "${EXTERNAL_PLUGIN}"
+    --external_plugins "${EXTERNAL_PLUGINS[@]}"
 
-    --reward_funcs accuracy format
-    # Optional:
-    # --reward_weights 1.0 0.2
+    --reward_funcs opd_ttrl_math_accuracy
 
     --system "${SYSTEM_PROMPT}"
     --enable_thinking false
@@ -169,6 +170,7 @@ CMD=(
     --num_generations_eval "${NUM_GENERATIONS_EVAL}"
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
     --learning_rate "${LEARNING_RATE}"
+    --lr_scheduler_type "${LR_SCHEDULER_TYPE}"
     --warmup_ratio "${WARMUP_RATIO}"
     --logging_steps "${LOGGING_STEPS}"
     --save_steps "${SAVE_STEPS}"
