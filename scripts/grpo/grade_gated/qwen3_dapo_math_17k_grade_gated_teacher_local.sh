@@ -15,14 +15,14 @@ set -euo pipefail
 
 SYSTEM_PROMPT="You are a helpful math assistant. Solve the problem step by step and put your final answer within \\boxed{}."
 
-CUDA_VISIBLE_DEVICES="0,1,2,3"
-NPROC_PER_NODE=4
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+NPROC_PER_NODE=8
 NNODES=1
 NODE_RANK=0
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT=29500
 
-MODEL="Qwen/Qwen3-8B"
+MODEL="Qwen/Qwen3-4B-Instruct-2507"
 TEACHER_BACKEND="local"
 TEACHER_MODEL="Qwen/Qwen3-14B"
 TEACHER_MODEL_SERVER="http://teacher-host:8000"
@@ -30,22 +30,24 @@ TEACHER_DEEPSPEED=""
 OFFLOAD_TEACHER_MODEL="true"
 GKD_LOGITS_TOPK=16
 DATASET="open-r1/DAPO-Math-17k-Processed"
-OUTPUT_DIR="output/Qwen3-8B-GRADE-Gated-DAPO-Math-17k-Teacher"
+OUTPUT_DIR="output/Qwen3-4B-Instruct-2507-GRADE-Gated-DAPO-Math-17k-Teacher"
 
-TRAIN_TYPE="lora"
+TUNER_TYPE="full"
 TORCH_DTYPE="bfloat16"
 DEEPSPEED_STAGE="zero2"
 
 MAX_PROMPT_LENGTH=1024
-MAX_LENGTH=8192
-MAX_COMPLETION_LENGTH=7168
-VLLM_MAX_MODEL_LEN=8192
+MAX_LENGTH=9216
+MAX_COMPLETION_LENGTH=8192
+VLLM_MAX_MODEL_LEN=9216
 VLLM_GPU_MEMORY_UTILIZATION=0.4
 VLLM_TENSOR_PARALLEL_SIZE=1
+SOFT_MAX_LENGTH=8192
+SOFT_CACHE_LENGTH=2048
 
 NUM_TRAIN_EPOCHS=1
-PER_DEVICE_TRAIN_BATCH_SIZE=2
-PER_DEVICE_EVAL_BATCH_SIZE=2
+PER_DEVICE_TRAIN_BATCH_SIZE=1
+PER_DEVICE_EVAL_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=8
 NUM_GENERATIONS=4
 LEARNING_RATE=1e-6
@@ -58,16 +60,13 @@ DATALOADER_NUM_WORKERS=4
 DATASET_NUM_PROC=4
 REPORT_TO="wandb"
 WANDB_PROJECT="opd"
-RUN_NAME="qwen3_8b_grade_gated_teacher_local_dapo_math_17k"
+RUN_NAME="qwen3_4b_instruct_2507_grade_gated_teacher_local_dapo_math_17k"
 
 TEMPERATURE=1.0
 TOP_P=0.95
 TOP_K=50
 MAX_GRAD_NORM=1.0
 SLEEP_LEVEL=1
-
-LORA_RANK=16
-LORA_ALPHA=32
 
 BETA=0.0
 REF_KL_EXTRA_VOCAB_TOPK=0
@@ -101,11 +100,13 @@ CMD=(
     --loss_type grade_gated
     --model "${MODEL}"
     --dataset "${DATASET}"
-    --reward_funcs accuracy
+    --reward_funcs accuracy soft_overlong
     --system "${SYSTEM_PROMPT}"
     --enable_thinking false
     --load_from_cache_file true
     --torch_dtype "${TORCH_DTYPE}"
+    --soft_max_length "${SOFT_MAX_LENGTH}"
+    --soft_cache_length "${SOFT_CACHE_LENGTH}"
     --max_prompt_length "${MAX_PROMPT_LENGTH}"
     --max_length "${MAX_LENGTH}"
     --max_completion_length "${MAX_COMPLETION_LENGTH}"
@@ -145,6 +146,7 @@ CMD=(
     --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}"
     --sleep_level "${SLEEP_LEVEL}"
     --deepspeed "${DEEPSPEED_STAGE}"
+    --tuner_type "${TUNER_TYPE}"
     --log_completions true
     --overlong_filter true
     --output_dir "${OUTPUT_DIR}"
@@ -166,21 +168,6 @@ elif [[ "${TEACHER_BACKEND}" == "server" ]]; then
     CMD+=(--teacher_model_server "${TEACHER_MODEL_SERVER}" --gkd_logits_topk "${GKD_LOGITS_TOPK}")
 else
     echo "Unsupported TEACHER_BACKEND=${TEACHER_BACKEND}. Expected 'local' or 'server'." >&2
-    exit 1
-fi
-
-if [[ "${TRAIN_TYPE}" == "lora" ]]; then
-    CMD+=(
-        --tuner_type lora
-        --vllm_enable_lora true
-        --target_modules all-linear
-        --lora_rank "${LORA_RANK}"
-        --lora_alpha "${LORA_ALPHA}"
-    )
-elif [[ "${TRAIN_TYPE}" == "full" ]]; then
-    CMD+=(--tuner_type full)
-else
-    echo "Unsupported TRAIN_TYPE=${TRAIN_TYPE}. Expected 'lora' or 'full'." >&2
     exit 1
 fi
 
