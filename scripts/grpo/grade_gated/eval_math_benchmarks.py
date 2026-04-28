@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""Run OPD-style math evaluation with ms-swift/EvalScope.
-
-Defaults follow the evaluation protocol in the OPD paper:
-16 sampled solutions per problem, temperature 0.7, top-p 0.95, and a
-31,744-token validation response budget. AMC is restricted to AMC 2023.
-"""
+"""Run single-model OPD-style math evaluation with ms-swift/EvalScope."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 DEFAULT_DATASETS = ["aime24", "aime25", "math_500", "amc"]
 DEFAULT_DATASET_ARGS = {"amc": {"subset_list": ["amc23"]}}
+
+
+def str_to_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value!r}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,15 +33,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional LoRA adapter checkpoint(s). For full-parameter checkpoints, leave this unset.",
     )
     parser.add_argument("--eval-url", default=None, help="Existing OpenAI-compatible service URL.")
+    parser.add_argument("--port", type=int, default=8000, help="Local Swift/vLLM deployment start port.")
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS, help="EvalScope Native dataset names.")
     parser.add_argument(
         "--dataset-args",
         default=json.dumps(DEFAULT_DATASET_ARGS),
         help="JSON dataset_args passed to EvalScope. Default selects AMC subset amc23.",
     )
-    parser.add_argument("--output-dir", default=None, help="Directory for raw repeat reports and summary.json.")
+    parser.add_argument("--output-dir", default=None, help="Directory for report.json and summary.json.")
     parser.add_argument("--repeats", type=int, default=16, help="Number of sampled solutions per problem.")
-    parser.add_argument("--seed", type=int, default=42, help="Base seed; repeat i uses seed+i.")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for the EvalScope task.")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=-1)
@@ -46,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-max-model-len", type=int, default=32768)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=8)
+    parser.add_argument("--vllm-enable-prefix-caching", type=str_to_bool, default=True)
     parser.add_argument("--eval-num-proc", type=int, default=8)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--infer-backend", default="vllm", choices=["vllm", "transformers", "sglang", "lmdeploy"])
@@ -93,32 +99,24 @@ def flatten_numeric(obj: Any, prefix: str = "") -> Dict[str, float]:
     return values
 
 
-def mean(values: Iterable[float]) -> float:
-    vals = list(values)
-    return sum(vals) / len(vals)
-
-
-def summarize(reports: List[Mapping[str, Any]], backend: str) -> Dict[str, Any]:
-    by_metric: Dict[str, List[float]] = defaultdict(list)
-    for report in reports:
-        for key, value in flatten_numeric(report.get(backend, {})).items():
-            by_metric[key].append(value)
-
+def summarize(report: Mapping[str, Any], backend: str, repeats: int) -> Dict[str, Any]:
     return {
         key: {
-            "mean": mean(values),
-            "num_repeats": len(values),
-            "values": values,
+            "mean": value,
+            "num_repeats": repeats,
+            "values": [value],
         }
-        for key, values in sorted(by_metric.items())
+        for key, value in sorted(flatten_numeric(report.get(backend, {})).items())
     }
 
 
-def run_eval(args: argparse.Namespace) -> Dict[str, Any]:
+def run_eval(args: argparse.Namespace, output_dir: Path) -> Dict[str, Any]:
     from swift import EvalArguments, eval_main
 
     dataset_args = json_arg(args.dataset_args, DEFAULT_DATASET_ARGS)
     extra_eval_args = json_arg(args.extra_eval_args)
+    extra_eval_args["repeats"] = args.repeats
+    extra_eval_args["seed"] = args.seed
     generation_config = {
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
@@ -131,15 +129,17 @@ def run_eval(args: argparse.Namespace) -> Dict[str, Any]:
         model=args.model,
         adapters=args.adapters or [],
         eval_url=args.eval_url,
+        port=args.port,
         eval_dataset=args.datasets,
         eval_dataset_args=dataset_args,
         eval_generation_config=generation_config,
         extra_eval_args=extra_eval_args,
-        eval_output_dir=str(args.repeat_output_dir),
+        eval_output_dir=str(output_dir / "eval"),
         eval_backend="Native",
         infer_backend=args.infer_backend,
         eval_limit=args.eval_limit,
         eval_num_proc=args.eval_num_proc,
+        seed=args.seed,
         torch_dtype=args.torch_dtype,
         temperature=args.temperature,
         system=args.system,
@@ -147,28 +147,37 @@ def run_eval(args: argparse.Namespace) -> Dict[str, Any]:
         vllm_max_model_len=args.vllm_max_model_len,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_num_seqs=args.vllm_max_num_seqs,
+        vllm_enable_prefix_caching=args.vllm_enable_prefix_caching,
     )
-    eval_args.eval_generation_config["seed"] = args.seed_for_repeat
     return eval_main(eval_args)
 
 
 def main() -> None:
     args = parse_args()
     out_dir = output_dir_for(args)
+    dataset_args = json_arg(args.dataset_args, DEFAULT_DATASET_ARGS)
     resolved_config = {
         "model": args.model,
         "adapters": args.adapters or [],
         "eval_url": args.eval_url,
+        "port": args.port,
         "datasets": args.datasets,
-        "dataset_args": json_arg(args.dataset_args, DEFAULT_DATASET_ARGS),
+        "dataset_args": dataset_args,
         "repeats": args.repeats,
+        "seed": args.seed,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
         "max_tokens": args.max_tokens,
         "vllm_max_model_len": args.vllm_max_model_len,
+        "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+        "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+        "vllm_max_num_seqs": args.vllm_max_num_seqs,
+        "vllm_enable_prefix_caching": args.vllm_enable_prefix_caching,
         "eval_num_proc": args.eval_num_proc,
         "infer_backend": args.infer_backend,
+        "torch_dtype": args.torch_dtype,
         "system": args.system,
         "enable_thinking": args.enable_thinking == "true",
         "output_dir": str(out_dir),
@@ -181,30 +190,30 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config.json").write_text(json.dumps(resolved_config, indent=2, ensure_ascii=False) + "\n")
 
-    reports: List[Mapping[str, Any]] = []
-    for repeat_idx in range(args.repeats):
-        repeat_dir = out_dir / f"repeat-{repeat_idx:02d}"
-        repeat_dir.mkdir(parents=True, exist_ok=True)
-        args.repeat_output_dir = repeat_dir
-        args.seed_for_repeat = args.seed + repeat_idx
-
-        print(f"[opd-eval] repeat {repeat_idx + 1}/{args.repeats}, seed={args.seed_for_repeat}", flush=True)
-        report = run_eval(args)
-        reports.append(report)
-        (repeat_dir / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    print(
+        f"[opd-eval] repeats={args.repeats}, seed={args.seed}, tp={args.vllm_tensor_parallel_size}",
+        flush=True,
+    )
+    report = run_eval(args, out_dir)
+    (out_dir / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
     summary = {
         "protocol": {
-            "metric": "avg@16 when repeats=16; mean accuracy over independent sampled solutions",
+            "metric": "avg@N; EvalScope repeats samples each problem N times in one task",
+            "repeats": args.repeats,
             "datasets": args.datasets,
-            "amc_subset": json_arg(args.dataset_args, DEFAULT_DATASET_ARGS).get("amc", {}).get("subset_list"),
+            "amc_subset": dataset_args.get("amc", {}).get("subset_list"),
+            "port": args.port,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
             "max_tokens": args.max_tokens,
+            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+            "vllm_max_num_seqs": args.vllm_max_num_seqs,
+            "vllm_enable_prefix_caching": args.vllm_enable_prefix_caching,
         },
-        "summary": summarize(reports, "Native"),
-        "reports": reports,
+        "summary": summarize(report, "Native", args.repeats),
+        "reports": [report],
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     print(f"[opd-eval] summary written to {out_dir / 'summary.json'}", flush=True)

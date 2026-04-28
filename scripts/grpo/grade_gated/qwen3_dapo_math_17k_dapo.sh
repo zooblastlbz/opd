@@ -15,6 +15,10 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NPROC_PER_NODE=8
 MASTER_PORT=29509
 
+export OMPI_ALLOW_RUN_AS_ROOT=1
+export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+mpirun --hostfile $HOSTFILE --pernode -x PATH sh -c 'rm -f /dev/shm/nccl-*'
+
 # DeepSpeed env propagation
 DEEPSPEED_ENV_SOURCE="/ytech_m2v8_hdd/workspace/kling_mm/libozhou/feature_combination/env_a800"
 export TORCH_DISTRIBUTED_TIMEOUT=1800
@@ -30,21 +34,21 @@ set +a
 # Resume Config
 # ==========================================
 # 设置为 "true" 启用自动 resume，"false" 则从头训练
-RESUME="true"
-# 如果指定了具体路径，则从此路径 resume；留空则自动从 OUTPUT_DIR 中找最新 checkpoint
-RESUME_FROM_CHECKPOINT="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/output/Qwen3-8B-DAPO-DAPO-Math-17k-format-len8192/v5-20260423-213817/checkpoint-260"
+OUTPUT_DIR="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/output/Qwen3-8B-DAPO-DAPO-Math-17k-hard-format-len8192_zero_rl/"
 
+RESUME="false"
+RESUME_FROM_CHECKPOINT="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/output/Qwen3-8B-DAPO-DAPO-Math-17k-hard-format-len8192/v0-20260424-171225/checkpoint-20"
 # format reward requires:
 # <think>...</think><answer>...</answer>
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a math question, and the Assistant solves it. The assistant must first provide the reasoning process inside <think> </think> tags, and then provide the final answer inside <answer> </answer> tags. Put the final mathematical answer inside \\boxed{} within the <answer> tag. The required format is: <think> reasoning here </think><answer> \\boxed{final answer} </answer>"
 
-MODEL="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen3-8B"
+MODEL="/ytech_m2v5_hdd/workspace/kling_mm/yangsihan05/models/Qwen/Qwen3-8B-Base/"
 DATASET="/ytech_m2v5_hdd/workspace/kling_mm/Datasets/DAPO-Math-17k-Processed"
 VAL_DATASETS=("aime2025_i_val" "aime2025_ii_val")
 REWARD_PLUGIN="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/scripts/grpo/grade_gated/opd_ttrl_math_reward.py"
 VAL_PLUGIN="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/scripts/grpo/grade_gated/aime2025_val_plugin.py"
 EXTERNAL_PLUGINS=("${REWARD_PLUGIN}" "${VAL_PLUGIN}")
-OUTPUT_DIR="output/Qwen3-8B-DAPO-DAPO-Math-17k-format-len8192"
+
 
 TUNER_TYPE="full"
 TORCH_DTYPE="bfloat16"
@@ -77,19 +81,19 @@ DATALOADER_NUM_WORKERS=4
 DATASET_NUM_PROC=4
 REPORT_TO="wandb"
 WANDB_PROJECT="opd"
-RUN_NAME="qwen3_8b_dapo_dapo_math_17k_format_len8192"
+RUN_NAME="qwen3_8b_dapo_dapo_math_17k_hard_format_len8192_zero_rl"
 
 TEMPERATURE=1.0
 #TOP_P=0.9
 #TOP_K=0
 MAX_GRAD_NORM=1.0
-SLEEP_LEVEL=1
+SLEEP_LEVEL=0
 
 LOSS_TYPE="dapo"
 EPSILON=0.2
 EPSILON_HIGH=0.28
 DYNAMIC_SAMPLE="false"
-BETA=0.001
+BETA=0.00
 REF_KL_EXTRA_VOCAB_TOPK=0
 
 # ==========================================
