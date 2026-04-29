@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass
+import math
 from typing import Literal, Optional
 
 import torch
@@ -58,6 +59,122 @@ def align_vocab_size(student_logits: torch.Tensor, teacher_logits: torch.Tensor)
         teacher_logits = F.pad(teacher_logits, (0, stu_vocab - tea_vocab), 'constant', 0)
         teacher_logits[..., tea_vocab:] = student_logits[..., tea_vocab:]
     return student_logits, teacher_logits
+
+
+def _minmax_normalize(values: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    min_value = values.min()
+    max_value = values.max()
+    return (values - min_value) / (max_value - min_value).clamp(min=eps)
+
+
+def apply_tip_token_selection(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    method: Literal['entropy', 'soft_or', 'q3'],
+    retain_ratio: float,
+    chunk_size: int = 512,
+    temperature: float = 1.0,
+):
+    """Mask labels to the TIP-selected token subset.
+
+    This helper computes token-importance scores over the full vocabulary and
+    returns a copy of labels where unselected valid tokens are changed to -100.
+    """
+    if labels is None:
+        raise ValueError('TIP token selection requires labels for token masking.')
+    if teacher_logits is None:
+        raise ValueError('TIP token selection requires full teacher logits.')
+    if retain_ratio <= 0 or retain_ratio > 1:
+        raise ValueError(f'tip_retain_ratio must be in (0, 1], got {retain_ratio}.')
+    if chunk_size <= 0:
+        raise ValueError(f'tip_score_chunk_size must be positive, got {chunk_size}.')
+    if temperature <= 0:
+        raise ValueError(f'temperature must be positive, got {temperature}.')
+
+    valid_mask = labels != -100
+    num_valid = int(valid_mask.sum().item())
+    metrics = {
+        'selected_tokens': 0.0,
+        'valid_tokens': float(num_valid),
+        'retain_ratio_actual': 0.0,
+        'score_mean': 0.0,
+        'entropy_mean': 0.0,
+        'divergence_mean': 0.0,
+    }
+    if num_valid == 0:
+        return labels, metrics
+    if retain_ratio >= 1:
+        metrics.update({
+            'selected_tokens': float(num_valid),
+            'retain_ratio_actual': 1.0,
+        })
+        return labels, metrics
+
+    method = method.lower()
+    if method not in {'entropy', 'soft_or', 'q3'}:
+        raise ValueError(f'Unsupported TIP token selection method: {method}.')
+
+    with torch.no_grad():
+        student_logits, teacher_logits = align_vocab_size(student_logits, teacher_logits)
+        student_logits = student_logits[valid_mask]
+        teacher_logits = teacher_logits[valid_mask]
+        vocab_size = student_logits.shape[-1]
+        log_vocab_size = math.log(max(vocab_size, 2))
+
+        entropy_chunks = []
+        reverse_kl_chunks = []
+        forward_kl_chunks = []
+        need_forward_kl = method == 'q3'
+
+        for start_idx in range(0, num_valid, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_valid)
+            s_log_probs = F.log_softmax(student_logits[start_idx:end_idx] / temperature, dim=-1)
+            t_log_probs = F.log_softmax(teacher_logits[start_idx:end_idx] / temperature, dim=-1)
+            s_probs = s_log_probs.exp()
+
+            entropy_chunks.append(-(s_probs * s_log_probs).sum(dim=-1) / log_vocab_size)
+            reverse_kl_chunks.append((s_probs * (s_log_probs - t_log_probs)).sum(dim=-1))
+
+            if need_forward_kl:
+                t_probs = t_log_probs.exp()
+                forward_kl_chunks.append((t_probs * (t_log_probs - s_log_probs)).sum(dim=-1))
+
+        entropy = torch.cat(entropy_chunks, dim=0)
+        reverse_kl = torch.cat(reverse_kl_chunks, dim=0)
+
+        entropy_score = _minmax_normalize(entropy)
+        reverse_kl_score = _minmax_normalize(reverse_kl)
+
+        if method == 'entropy':
+            scores = entropy_score
+            divergence_for_metrics = reverse_kl
+        elif method == 'soft_or':
+            scores = entropy_score + reverse_kl_score - entropy_score * reverse_kl_score
+            divergence_for_metrics = reverse_kl
+        else:
+            forward_kl = torch.cat(forward_kl_chunks, dim=0)
+            forward_kl_score = _minmax_normalize(forward_kl)
+            scores = (1 - entropy_score) * forward_kl_score
+            divergence_for_metrics = forward_kl
+
+        selected_count = max(1, min(num_valid, int(num_valid * retain_ratio)))
+        selected_indices = torch.topk(scores, k=selected_count, largest=True).indices
+
+        selected_valid_mask = torch.zeros(num_valid, dtype=torch.bool, device=labels.device)
+        selected_valid_mask[selected_indices] = True
+        selected_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        selected_mask[valid_mask] = selected_valid_mask
+
+        selected_labels = labels.masked_fill(valid_mask & ~selected_mask, -100)
+        metrics.update({
+            'selected_tokens': float(selected_count),
+            'retain_ratio_actual': selected_count / num_valid,
+            'score_mean': float(scores.mean().item()),
+            'entropy_mean': float(entropy.mean().item()),
+            'divergence_mean': float(divergence_for_metrics.mean().item()),
+        })
+        return selected_labels, metrics
 
 
 def generalized_jsd_loss(

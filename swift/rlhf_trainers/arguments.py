@@ -19,7 +19,7 @@ from trl import DPOConfig as HfDPOConfig
 from trl import GRPOConfig as HfGRPOConfig
 from trl import KTOConfig as HfKTOConfig
 from trl import RewardConfig as HfRewardConfig
-from typing import Optional
+from typing import Literal, Optional
 
 from swift.trainers import TrainArgumentsMixin
 from .args_mixin import GRPOArgumentsMixin, RolloutTrainerArgumentsMixin
@@ -85,11 +85,18 @@ class GKDConfig(RolloutTrainerArgumentsMixin, TrainArgumentsMixin, HfGKDConfig):
     offload_teacher_model: bool = False
     max_completion_length: int = 512
     log_completions: bool = False
+    tip_token_selection: Literal['none', 'entropy', 'soft_or', 'q3'] = 'none'
+    tip_retain_ratio: float = 1.0
+    tip_score_chunk_size: int = 512
 
     def __post_init__(self):
         RolloutTrainerArgumentsMixin.__post_init__(self)
         TrainArgumentsMixin.__post_init__(self)
         HfGKDConfig.__post_init__(self)
+        if self.tip_retain_ratio <= 0 or self.tip_retain_ratio > 1:
+            raise ValueError(f'tip_retain_ratio must be in (0, 1], got {self.tip_retain_ratio}.')
+        if self.tip_score_chunk_size <= 0:
+            raise ValueError(f'tip_score_chunk_size must be positive, got {self.tip_score_chunk_size}.')
 
 
 @dataclass

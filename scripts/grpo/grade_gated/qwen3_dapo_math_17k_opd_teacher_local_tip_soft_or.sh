@@ -2,39 +2,32 @@
 
 
 # pip install math_verify
-# Baseline OPD script: student rollouts + all-token, full-vocab reverse KL.
-# This is intentionally not TIP/grade-gated token selection.
+# TIP-style OPD script: student rollouts + full-vocab reverse KL on selected tokens.
 # Edit values in this block directly for your experiment.
-# Default launcher is DeepSpeed.
-# Single-node: run this script directly.
-# Multi-node: set USE_HOSTFILE_LAUNCH=true and provide HOSTFILE.
-
-# ==========================================
-# Launch Config
-# ==========================================
-USE_HOSTFILE_LAUNCH="false"
-HOSTFILE="/etc/mpi/hostfile_first2"
 
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a math question, and the Assistant solves it. The assistant must first provide the reasoning process inside <think> </think> tags, and then provide the final answer inside <answer> </answer> tags. Put the final mathematical answer inside \\boxed{} within the <answer> tag. The required format is: <think> reasoning here </think><answer> \\boxed{final answer} </answer>"
 
 CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NPROC_PER_NODE=8
+NNODES=1
+NODE_RANK=0
+MASTER_ADDR="127.0.0.1"
 MASTER_PORT=29500
 
-MODEL="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen3-1.7B-Base/"
-TEACHER_MODEL="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/output/Qwen3-8B-DAPO-DAPO-Math-17k-hard-format-len8192_zero_rl/v3-20260427-004019/checkpoint-271"
+MODEL="Qwen/Qwen3-4B-Instruct-2507"
+TEACHER_MODEL="Qwen/Qwen3-14B"
 TEACHER_DEEPSPEED="zero3_offload"
 OFFLOAD_TEACHER_MODEL="true"
-# 0 means do not pass --gkd_logits_topk, so local teacher full logits are used.
+# TIP scoring requires full teacher logits. Keep this at 0.
 GKD_LOGITS_TOPK=0
 DATASET="/ytech_m2v5_hdd/workspace/kling_mm/Datasets/DAPO-Math-17k-Processed"
-OUTPUT_DIR="output/Qwen3-4B-Instruct-2507-OPD-Baseline-FullVocab-DAPO-Math-17k"
+OUTPUT_DIR="output/Qwen3-4B-Instruct-2507-OPD-TIP-SoftOR50-DAPO-Math-17k"
 
 TUNER_TYPE="full"
 TORCH_DTYPE="bfloat16"
 DEEPSPEED_STAGE="zero2"
 
-
+MAX_PROMPT_LENGTH=1024
 MAX_LENGTH=1024
 MAX_COMPLETION_LENGTH=7168
 VLLM_MAX_MODEL_LEN=8192
@@ -42,9 +35,9 @@ VLLM_GPU_MEMORY_UTILIZATION=0.2
 VLLM_TENSOR_PARALLEL_SIZE=1
 
 NUM_TRAIN_EPOCHS=1
-PER_DEVICE_TRAIN_BATCH_SIZE=2
+PER_DEVICE_TRAIN_BATCH_SIZE=1
 PER_DEVICE_EVAL_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=4
+GRADIENT_ACCUMULATION_STEPS=8
 NUM_GENERATIONS=8
 LEARNING_RATE=1e-6
 LR_SCHEDULER_TYPE="constant"
@@ -57,7 +50,7 @@ DATALOADER_NUM_WORKERS=4
 DATASET_NUM_PROC=4
 REPORT_TO="wandb"
 WANDB_PROJECT="opd"
-RUN_NAME="qwen3_4b_instruct_2507_opd_full_vocab_teacher_local_dapo_math_17k"
+RUN_NAME="qwen3_4b_instruct_2507_opd_tip_soft_or50_teacher_local_dapo_math_17k"
 
 TEMPERATURE=1.0
 TOP_P=1.0
@@ -65,7 +58,7 @@ TOP_K=-1
 MAX_GRAD_NORM=1.0
 SLEEP_LEVEL=0
 
-# Baseline OPD:
+# OPD loss:
 # - LMBDA=1.0: always train on student-generated on-policy rollouts.
 # - BETA=1.0: generalized JSD degenerates to reverse KL, KL(student || teacher).
 # - SFT_ALPHA=0: no supervised CE term mixed into the OPD loss.
@@ -73,29 +66,22 @@ LMBDA=1.0
 BETA=1.0
 SFT_ALPHA=0
 
-LAUNCHER=(
-    deepspeed
-    --master_port="${MASTER_PORT}"
-)
-if [[ "${USE_HOSTFILE_LAUNCH}" == "true" ]]; then
-    if [[ -z "${HOSTFILE}" ]]; then
-        echo "HOSTFILE must be set when USE_HOSTFILE_LAUNCH=true." >&2
-        exit 1
-    fi
-    if [[ ! -f "${HOSTFILE}" ]]; then
-        echo "HOSTFILE does not exist: ${HOSTFILE}" >&2
-        exit 1
-    fi
-    export OMPI_ALLOW_RUN_AS_ROOT=1
-    export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-    mpirun --hostfile "${HOSTFILE}" --pernode -x PATH sh -c 'rm -f /dev/shm/nccl-*'
-    LAUNCHER+=(
-        --hostfile="${HOSTFILE}"
-        swift/cli/rlhf.py
-    )
-else
-    LAUNCHER+=(
-        --num_gpus="${NPROC_PER_NODE}"
+# TIP token selection:
+# - soft_or combines student entropy and student-teacher divergence scores.
+# - 0.5 keeps the top 50% valid response tokens; use 0.2 for a SoftOR20 run.
+TIP_TOKEN_SELECTION="soft_or"
+TIP_RETAIN_RATIO=0.5
+TIP_SCORE_CHUNK_SIZE=512
+
+LAUNCHER=(swift rlhf)
+if [[ "${NNODES}" != "1" ]]; then
+    LAUNCHER=(
+        torchrun
+        --nproc_per_node="${NPROC_PER_NODE}"
+        --nnodes="${NNODES}"
+        --node_rank="${NODE_RANK}"
+        --master_addr="${MASTER_ADDR}"
+        --master_port="${MASTER_PORT}"
         swift/cli/rlhf.py
     )
 fi
@@ -118,6 +104,7 @@ CMD=(
     --top_p "${TOP_P}"
     --top_k "${TOP_K}"
     --torch_dtype "${TORCH_DTYPE}"
+    --max_prompt_length "${MAX_PROMPT_LENGTH}"
     --max_length "${MAX_LENGTH}"
     --max_completion_length "${MAX_COMPLETION_LENGTH}"
     --num_train_epochs "${NUM_TRAIN_EPOCHS}"
@@ -145,6 +132,9 @@ CMD=(
     --sleep_level "${SLEEP_LEVEL}"
     --deepspeed "${DEEPSPEED_STAGE}"
     --tuner_type "${TUNER_TYPE}"
+    --tip_token_selection "${TIP_TOKEN_SELECTION}"
+    --tip_retain_ratio "${TIP_RETAIN_RATIO}"
+    --tip_score_chunk_size "${TIP_SCORE_CHUNK_SIZE}"
     --output_dir "${OUTPUT_DIR}"
     --report_to "${REPORT_TO_ARGS[@]}"
 )
@@ -162,5 +152,8 @@ fi
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 WANDB_PROJECT="${WANDB_PROJECT}" \
 NPROC_PER_NODE="${NPROC_PER_NODE}" \
+NNODES="${NNODES}" \
+NODE_RANK="${NODE_RANK}" \
+MASTER_ADDR="${MASTER_ADDR}" \
 MASTER_PORT="${MASTER_PORT}" \
 "${CMD[@]}"

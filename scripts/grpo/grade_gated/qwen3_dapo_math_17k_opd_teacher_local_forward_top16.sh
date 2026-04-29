@@ -2,7 +2,7 @@
 
 
 # pip install math_verify
-# Baseline OPD script: student rollouts + all-token, full-vocab reverse KL.
+# Forward-KL OPD script: student rollouts + teacher top-16 forward KL.
 # This is intentionally not TIP/grade-gated token selection.
 # Edit values in this block directly for your experiment.
 # Default launcher is DeepSpeed.
@@ -25,10 +25,10 @@ MODEL="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen3-1.7B-Base/"
 TEACHER_MODEL="/ytech_m2v5_hdd/workspace/kling_mm/libozhou/opd/output/Qwen3-8B-DAPO-DAPO-Math-17k-hard-format-len8192_zero_rl/v3-20260427-004019/checkpoint-271"
 TEACHER_DEEPSPEED="zero3_offload"
 OFFLOAD_TEACHER_MODEL="true"
-# 0 means do not pass --gkd_logits_topk, so local teacher full logits are used.
-GKD_LOGITS_TOPK=0
+# Positive value passes --gkd_logits_topk and computes KL on the teacher top-k subset.
+GKD_LOGITS_TOPK=16
 DATASET="/ytech_m2v5_hdd/workspace/kling_mm/Datasets/DAPO-Math-17k-Processed"
-OUTPUT_DIR="output/Qwen3-4B-Instruct-2507-OPD-Baseline-FullVocab-DAPO-Math-17k"
+OUTPUT_DIR="output/Qwen3-4B-Instruct-2507-OPD-ForwardKL-Top16-DAPO-Math-17k"
 
 TUNER_TYPE="full"
 TORCH_DTYPE="bfloat16"
@@ -57,7 +57,7 @@ DATALOADER_NUM_WORKERS=4
 DATASET_NUM_PROC=4
 REPORT_TO="wandb"
 WANDB_PROJECT="opd"
-RUN_NAME="qwen3_4b_instruct_2507_opd_full_vocab_teacher_local_dapo_math_17k"
+RUN_NAME="qwen3_4b_instruct_2507_opd_forward_kl_top16_teacher_local_dapo_math_17k"
 
 TEMPERATURE=1.0
 TOP_P=1.0
@@ -65,12 +65,12 @@ TOP_K=-1
 MAX_GRAD_NORM=1.0
 SLEEP_LEVEL=0
 
-# Baseline OPD:
+# Forward-KL OPD:
 # - LMBDA=1.0: always train on student-generated on-policy rollouts.
-# - BETA=1.0: generalized JSD degenerates to reverse KL, KL(student || teacher).
+# - BETA=0.0: generalized JSD degenerates to forward KL, KL(teacher || student).
 # - SFT_ALPHA=0: no supervised CE term mixed into the OPD loss.
 LMBDA=1.0
-BETA=1.0
+BETA=0.0
 SFT_ALPHA=0
 
 LAUNCHER=(

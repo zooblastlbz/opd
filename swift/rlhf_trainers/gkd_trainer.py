@@ -21,7 +21,8 @@ from swift.trainers import SwiftMixin, disable_gradient_checkpointing
 from swift.utils import (JsonlWriter, get_logger, is_swanlab_available, is_wandb_available, remove_response, to_device,
                          unwrap_model_for_generation)
 from .rollout_mixin import DataType, RolloutTrainerMixin
-from .teacher_utils import TeacherOutput, build_opsd_teacher_data, fetch_teacher_logprobs, generalized_jsd_loss
+from .teacher_utils import (TeacherOutput, apply_tip_token_selection, build_opsd_teacher_data, fetch_teacher_logprobs,
+                            generalized_jsd_loss)
 from .utils import (get_gather_if_zero3_context, identity_data_collator, prepare_deepspeed, profiling_context,
                     profiling_decorator)
 
@@ -71,6 +72,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.generation_config = model.generation_config
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._total_train_tokens = 0
+        self.tip_token_selection = getattr(args, 'tip_token_selection', 'none')
+        self.tip_retain_ratio = getattr(args, 'tip_retain_ratio', 1.0)
+        self.tip_score_chunk_size = getattr(args, 'tip_score_chunk_size', 512)
+        self._latest_tip_metrics = {}
 
         self.teacher_model_server = teacher_model_server
         self.use_teacher_api = teacher_model_server is not None
@@ -140,6 +145,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         # OPSD mode: student and teacher have different prompts, so apply separate masks
         if opsd_teacher_labels is not None:
+            if self.tip_token_selection != 'none':
+                raise ValueError('TIP token selection currently supports only local full-vocab OPD without OPSD.')
             shifted_teacher_labels = torch.roll(opsd_teacher_labels, shifts=-1, dims=1)
             student_mask = shifted_labels != -100
             teacher_mask = shifted_teacher_labels != -100
@@ -168,6 +175,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         # Top-k mode: teacher logprobs from API
         if teacher_output.is_topk_mode:
+            if self.tip_token_selection != 'none':
+                raise ValueError('TIP token selection requires local full-vocab teacher logits, not top-k/API mode.')
             return self.generalized_jsd_loss(
                 student_logits=student_logits,
                 labels=shifted_labels,
@@ -179,6 +188,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         # Full-vocab teacher with top-k reduction (local teacher model)
         if self.gkd_logits_topk is not None:
+            if self.tip_token_selection != 'none':
+                raise ValueError('TIP token selection requires full-vocab KL. Unset --gkd_logits_topk.')
             return self.generalized_jsd_loss(
                 student_logits=student_logits,
                 teacher_logits=teacher_output.full_logits,
@@ -188,7 +199,21 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 topk=self.gkd_logits_topk,
             )
 
-        # Full-vocab mode without top-k: vocab alignment handled inside generalized_jsd_loss
+        # Full-vocab mode without top-k: optionally keep only TIP-selected valid tokens
+        if self.tip_token_selection != 'none':
+            shifted_labels, self._latest_tip_metrics = apply_tip_token_selection(
+                student_logits=student_logits,
+                teacher_logits=teacher_output.full_logits,
+                labels=shifted_labels,
+                method=self.tip_token_selection,
+                retain_ratio=self.tip_retain_ratio,
+                chunk_size=self.tip_score_chunk_size,
+                temperature=self.temperature,
+            )
+        else:
+            self._latest_tip_metrics = {}
+
+        # Vocab alignment handled inside generalized_jsd_loss
         return self.generalized_jsd_loss(
             student_logits=student_logits,
             teacher_logits=teacher_output.full_logits,
@@ -658,6 +683,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         args = self.args
         self.use_liger_gkd_loss = False
         if getattr(args, 'use_liger_kernel', False):
+            if self.tip_token_selection != 'none':
+                raise ValueError('TIP token selection is not supported with use_liger_kernel. Disable liger loss.')
             if not _liger_kernel_available:
                 raise ImportError(
                     'Liger kernel is not installed. Please install liger-kernel by running: pip install liger-kernel')
@@ -720,6 +747,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         """Override log method to include completion table logging (aligned with GRPO)."""
+        if self._latest_tip_metrics:
+            logs = dict(logs)
+            logs.update({f'tip/{key}': value for key, value in self._latest_tip_metrics.items()})
+
         # Call parent log method
         import transformers
         from packaging import version
